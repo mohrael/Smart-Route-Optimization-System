@@ -1,0 +1,9 @@
+🧠 Problem
+
+Delivery companies (or even small businesses) waste time and money because routes are not optimized. Drivers may take longer paths, repeat roads, or follow inefficient orders.
+
+💡 Solution
+
+Takes multiple delivery locations and calculates the most efficient route between them using graph algorithms (Dijkstra + A*).
+
+![alt text](image.png)
