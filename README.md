@@ -1,85 +1,81 @@
-# 🚀 Delivery Route Optimizer
+# 🚀 Smart Route Optimization System
 
-A full-stack backend system that calculates the most efficient delivery routes using graph algorithms like Dijkstra.
+An interactive web application that computes the optimal route between multiple locations using graph search algorithms.
 
----
+## 📌 Overview
 
-## 🧠 Project Idea
+This project allows users to:
 
-This system solves real-world delivery routing problems by converting locations into a graph and computing optimal paths.
+* Select a start location and multiple destinations
+* Visualize routes on an interactive map
+* Compute optimized paths using backend algorithms
+* View total distance and execution time
 
----
+## 🧠 Key Features
 
-## ⚙️ Features
-
-- 📍 Real-world location data (OpenStreetMap)
-- 🧭 Graph-based routing system
-- ⚡ Dijkstra shortest path algorithm
-- 📦 Multi-destination route optimization (greedy approach)
-- 🗺️ Interactive map UI (Leaflet)
-- 🔐 JWT authentication
-- 📡 REST API (Django REST Framework)
-
----
+* 🗺️ Interactive map using Leaflet
+* 📍 Click-based location selection
+* 🔄 Dynamic route visualization with animated polylines
+* ⚡ Optimized routing using A* / search algorithms
+* 📊 Distance & performance metrics
 
 ## 🏗️ Tech Stack
 
-### Backend
-- Django
-- Django REST Framework
-- PostgreSQL / SQLite
-- JWT Authentication
-
 ### Frontend
-- React
-- Leaflet (Map visualization)
 
----
+* React.js
+* Leaflet (react-leaflet)
 
-## 🔄 How It Works
+### Backend
 
-1. User selects start + destinations
-2. Backend builds graph from database
-3. Dijkstra computes shortest paths
-4. System optimizes multi-stop route
-5. Result is returned and visualized on map
+* Django / Django REST Framework
 
----
+### Algorithms
 
-## 🧠 Algorithms Used
-
-- Dijkstra Algorithm (Shortest Path)
-- Greedy Heuristic (Multi-destination routing)
-- (Planned) A* Search
-
----
-
-## 🚧 Current Status
-
-✅ Core routing system complete  
-✅ Real map integration  
-🔄 Improving route optimization (2-opt / heuristics)  
-🔄 Performance optimization  
-
----
-
-## 🔥 Future Improvements
-
-- A* algorithm with heuristics
-- Traffic-aware routing
-- Google Maps API integration
-- Caching with Redis
-- Background processing (Celery)
-- Advanced route optimization (TSP)
-
----
+* A* Search
+* Graph-based pathfinding
 
 ## 📸 Demo
 
 ![alt text](image.png)
 
----
+## ⚙️ Installation
+
+### Backend
+
+```bash
+cd backend
+pip install -r requirements.txt
+python manage.py runserver
+```
+
+### Frontend
+
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+## 📡 API Example
+
+```json
+POST /routes/optimize-route/
+{
+  "start_location": { "lat": 30.0444, "lon": 31.2357 },
+  "destinations": [
+    { "lat": 30.05, "lon": 31.24 }
+  ]
+}
+```
+
+## 💡 Future Improvements
+
+* Add real road routing (Google Maps API / OSRM)
+* Add authentication & user history
+* Improve UI/UX with better controls
+* Mobile responsiveness
 
 ## 👨‍💻 Author
 
-Rania Raafat
+Your Name
