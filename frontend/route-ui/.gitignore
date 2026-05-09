@@ -22,3 +22,8 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+cache
+backend/cache
+
+cairo_graph.graphml

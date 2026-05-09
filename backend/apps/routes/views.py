@@ -2,168 +2,133 @@ from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
 from .serializers import RouteRequestSerializer, RouteResultSerializer
-from ..locations.models import Location, Edge
-from ..algorithms.utils import optimize_route
+from ..locations.models import Location
 from .models import RouteRequest, RouteRequestDestination, RouteResult
 import time
 from datetime import timedelta
 from drf_spectacular.utils import extend_schema, OpenApiExample
 from rest_framework.permissions import IsAuthenticated
-from django.http import JsonResponse
+from ..algorithms.engine import _initialize_graph_and_algorithm
+# from .services.route_service import RouteService
+import osmnx as ox
 
-# These are lazily initialized on first request
-GRAPH = None
-ALGORITHM = None
-
-
-def _initialize_graph_and_algorithm():
-    """Lazy initialization of graph and algorithm on first request."""
-    global GRAPH, ALGORITHM
-    if GRAPH is None or ALGORITHM is None:
-        from ..algorithms.graph_builder import build_graph
-        from ..algorithms.dijkstra import Dijkstra
-        GRAPH = build_graph()
-        ALGORITHM = Dijkstra(GRAPH)
+from ..algorithms.utils import optimize_route
 
 
-class RouteRequestView(APIView): 
+def _snap_coord_to_node(G,lat,lon):
+    return int(ox.distance.nearest_nodes(G,X=lon,Y=lat))
+
+def _get_access_nodes_for_coord(G,lat,lon,radius_meters=50):
+    north,south,east,west = ox.utils_geo.bbox_from_point((lat,lon),dist=radius_meters)
+
+    potential_nodes = []
+    for node_id in G.nodes:
+        if 'y' in G.nodes[node_id] and 'x' in G.nodes[node_id]:
+            if south <= G.nodes[node_id]['y'] <= north and west <= G.nodes[node_id]['x'] <= east:
+               potential_nodes.append(int(node_id))
+
+
+class RouteRequestView(APIView):
     permission_classes = [IsAuthenticated]
     serializer_class = RouteRequestSerializer
 
-    @extend_schema(
-        request=RouteRequestSerializer,  # Request body schema
-        responses={
-            201: RouteResultSerializer,
-            400: OpenApiExample(
-                'Validation Error',
-                summary='Invalid input example',
-                value={"name": ["This field is required."]}
-            )
-        },
-        summary="Create a new route request",
-        description="This endpoint creates a new route request and returns its details.",
-        examples=[
-            OpenApiExample(
-                'Example Request',
-                value={"start_location":2,"destinations":[1,6,7,3]},
-                request_only=True 
-            ),
-            OpenApiExample(
-                'Example Response',
-                value={
-                    "id": 1,
-                    "route_request": 1,
-                    "total_cost": 51.5,
-                    "path": [
-                        2,
-                        1,
-                        2,
-                        3,
-                        6,
-                        7
-                    ],
-                    "algorithm_used": "DIJKSTRA",
-                    "execution_time": "00:00:00.000111"
-                }
-            )
-        ]
-    )
-    
-    
     def post(self, request, *args, **kwargs):
-        # Lazy initialize graph and algorithm on first request
-        _initialize_graph_and_algorithm()
-        
+        try:
+            G, GRAPH, ALGORITHM = _initialize_graph_and_algorithm()
+        except RuntimeError as e:
+            return Response({"error": str(e)}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+
+        # service = RouteService(G)
         serializer = RouteRequestSerializer(data=request.data)
+
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
         
-        if serializer.is_valid():
-            start_id = serializer.validated_data['start_location']
-            destinations_list = serializer.validated_data['destinations']
-            
-            # fetch all locations once
-            all_locations = {loc.id: loc for loc in Location.objects.all()}
-            
-            # validate start location
-            if start_id not in all_locations:
-                return Response(
-                    {"error":"invalid start location"},
-                    status=status.HTTP_400_BAD_REQUEST
-                )
-            start_location = all_locations[start_id]
-            
-            # convert list to set
-            destinations_set = set(destinations_list)
-            
-            # validate all destinations exist before proceeding
-            invalid_destinations = destinations_set - set(all_locations.keys())
-            if invalid_destinations:
-                return Response(
-                    {"error": f"invalid destination location(s): {list(invalid_destinations)}"}, 
-                    status=status.HTTP_400_BAD_REQUEST
-                )
-            
-            # create one RouteRequest
-            route_request = RouteRequest.objects.create(user=request.user, start_location=start_location)
+        start_coord = serializer.validated_data['start_location']   # {lat, lon}
+        dest_coords = serializer.validated_data['destinations']      # [{lat, lon}, ...]
+        
+        try:
+            start_nodes = _get_access_nodes_for_coord(G,start_coord['lat'],start_coord['lon'])
 
-            # create multiple RouteRequestDestination rows
-            destination_objs = [
-                RouteRequestDestination(
-                    route_request=route_request,
-                    location=all_locations[dest_id]
-                )
-                for dest_id in destinations_list
-            ]
-                
-            RouteRequestDestination.objects.bulk_create(destination_objs)
-            
-            start_time = time.perf_counter()
-            # run algorithm (using pre-built graph and algorithm)
-            path, cost = optimize_route(ALGORITHM, GRAPH, start_location.id, destinations_list)
-            
+            if not start_nodes:
+                start_nodes = [_snap_coord_to_node(G, start_coord['lat'], start_coord['lon'])]
            
-            end_time = time.perf_counter()
-            execution_time = timedelta(seconds=end_time - start_time)
+            dest_nodes_list = [
+                _get_access_nodes_for_coord(G,d['lat'],d['lon'])
+                for d in dest_coords
+            ]
+            for i, dest_group in enumerate(dest_nodes_list):
+                 if not dest_group:
+                     dest_nodes_list[i] = [_snap_coord_to_node(G, dest_coords[i]['lat'], dest_coords[i]['lon'])]
             
-            
-             # check if path was found
-            if path is None or cost == float("inf"):
-                return Response(
-                    {"error": "unreachable destination(s) - no valid path found"},
-                    status=status.HTTP_400_BAD_REQUEST
-                )
-            
-            route_result = RouteResult.objects.create(
-                route_request=route_request,
-                total_cost=cost,
-                path = path,
-                algorithm_used=RouteResult.AlgorithmChoices.DIJKSTRA,
-                execution_time=execution_time,
-            )
-            
-            route_result_serializer = RouteResultSerializer(route_result)
-            return Response(route_result_serializer.data, status=status.HTTP_201_CREATED)
-            # return Response(
-            #     {
-            #         "request_id": route_request.id,
-            #         "path" : path,
-            #         "cost": cost,
-            #         "execution time": execution_time,
-            #         "destinations": destinations_list
-            #     },
-            #     status= status.HTTP_201_CREATED
-            # )
+        except Exception as e:
+            return Response({"error": f"Failed to snap coordinates to graph: {str(e)}"}, status=status.HTTP_400_BAD_REQUEST)
 
-        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-    
-    
+
+        # start_id = serializer.validated_data['start_location']
+        # destinations_list = serializer.validated_data['destinations']
+
+        # requested_ids = set([start_id] + destinations_list)
+        # locations_qs = Location.objects.filter(id__in=requested_ids)
+        # all_locations = {loc.id: loc for loc in locations_qs}
+
+        # if start_id not in all_locations:
+        #     return Response({"error": "invalid start location"}, status=status.HTTP_400_BAD_REQUEST)
+
+        # start_location = all_locations[start_id]
+        # invalid_destinations = set(destinations_list) - set(all_locations.keys())
+        # if invalid_destinations:
+        #     return Response(
+        #         {"error": f"invalid destination location(s): {list(invalid_destinations)}"},
+        #         status=status.HTTP_400_BAD_REQUEST
+        #     )
+
+        route_request = RouteRequest.objects.create(
+            user=request.user,
+            start_lat=start_coord['lat'],
+            start_lon=start_coord['lon']
+        )
+        # destination_objects = [all_locations[dest_id] for dest_id in destinations_list]
+
+        RouteRequestDestination.objects.bulk_create([
+            RouteRequestDestination(
+                route_request=route_request, 
+                lat=d['lat'],
+                lon=d['lon']
+            )
+            for d in dest_coords
+        ])
+
+        # service = RouteService(G)
+
+
+        start_time = time.perf_counter()
+        path, cost = optimize_route(G,start_nodes, dest_nodes_list)
+        execution_time = timedelta(seconds=time.perf_counter() - start_time)
+
+        if path is None or cost is None or cost == float("inf"):
+            return Response(
+                {"error": "unreachable destination(s) - no valid path found"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        route_result = RouteResult.objects.create(
+            route_request=route_request,
+            total_cost=cost,
+            path=path,
+            algorithm_used=RouteResult.AlgorithmChoices.DIJKSTRA,
+            execution_time=execution_time,
+        )
+
+        return Response(RouteResultSerializer(route_result).data, status=status.HTTP_201_CREATED)
+
     def get(self, request, *args, **kwargs):
         requests = RouteRequest.objects.filter(user=self.request.user)
-
         result = []
         for req in requests:
             destinations = list(
                 RouteRequestDestination.objects.filter(route_request=req)
-                .values_list("location_id", flat=True)
+                .values('lat','lon')
             )
             try:
                 res = RouteResult.objects.get(route_request=req)
@@ -171,9 +136,9 @@ class RouteRequestView(APIView):
             except RouteResult.DoesNotExist:
                 result_data = None
             result.append({
-                "request_id":req.id,
-                "start_location": req.start_location.id,
-                "destinations":destinations,
+                "request_id": req.id,
+                "start": {"lat":req.start_lat,"lon":req.start_lon},
+                "destinations": destinations,
                 "result": result_data
             })
         return Response(result, status=status.HTTP_200_OK)
@@ -183,31 +148,78 @@ class RouteResultView(APIView):
     def get(self, request, pk):
         try:
             route_result = RouteResult.objects.get(pk=pk)
-            path_ids = route_result.path
-
-            locations = Location.objects.filter(id__in=path_ids)
-
-            loc_map = {
-                loc.id: {
-                    "id": loc.id,
-                    "name": loc.name,
-                    "latitude": loc.latitude,
-                    "longitude": loc.longitude
-                }
-                for loc in locations
-            }
-
-            path_with_coords = [loc_map[loc_id] for loc_id in path_ids]
-
-            return Response({
-                "route_request": route_result.route_request.id,
-                "total_distance_km": round(route_result.total_cost,2),
-                # "total_cost": route_result.total_cost,
-                "path": path_with_coords
-            })
-
         except RouteResult.DoesNotExist:
-            return Response(
-                {"error": "RouteResult not found"},
-                status=status.HTTP_404_NOT_FOUND
-            )
+            return Response({"error": "RouteResult not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        try:
+            G, _, _ = _initialize_graph_and_algorithm()
+        except RuntimeError as e:
+            return Response({"error": str(e)}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+
+        path_ids = route_result.path
+        # location_map = {
+        #     loc.id: loc
+        #     for loc in Location.objects.filter(id__in=path_ids)
+        # }
+
+        path_with_coords = []
+        for i in range(len(path_ids)):
+            try:
+                node_id = int(path_ids[i])
+            except (TypeError, ValueError):
+                continue
+
+            if node_id in G.nodes:
+                path_with_coords.append({
+                    "latitude": G.nodes[node_id]['y'],
+                    "longitude": G.nodes[node_id]['x']
+                })
+
+                # node_data = G.nodes[node_id]
+                
+                # lat = node_data.get("y")
+                # lon = node_data.get("x")
+                
+                # if lat is None or lon is None:
+                #     continue
+                
+                # path_with_coords.append({
+                #     # "id": node_id,
+                #     # "name": node_data.get("name") or f"OSM node {node_id}",
+                #     "latitude": lat,
+                #     "longitude": lon
+                # })
+            if i < len(path_ids) - 1:
+                next_node_id = int(path_ids[i+1])
+                
+                if G.has_edge(node_id, next_node_id):
+                    # MultiDiGraphs can have multiple parallel roads, get the shortest one
+                    edges = G.get_edge_data(node_id, next_node_id)
+                    edge_data = min(edges.values(), key=lambda x: x.get('length', float('inf')))
+
+                    # If the road curves, it has a 'geometry' attribute (Shapely LineString)
+                    if 'geometry' in edge_data:
+                        # Extract all the little curve coordinates (lon, lat)
+                        # We use [1:-1] to skip the first and last points so we don't duplicate the intersection nodes
+                        for lon, lat in list(edge_data['geometry'].coords)[1:-1]:
+                            path_with_coords.append({
+                                "latitude": lat,
+                                "longitude": lon
+                            })
+            # elif node_id in location_map:
+            #     loc = location_map[node_id]
+            #     path_with_coords.append({
+            #         "id": loc.id,
+            #         "name": loc.name,
+            #         "latitude": loc.latitude,
+            #         "longitude": loc.longitude
+            #     })
+
+        # total_cost is in meters (OSM edge length), convert to km
+        distance_km = round(route_result.total_cost / 1000, 2)
+
+        return Response({
+            "route_request": route_result.route_request.id,
+            "total_distance_km": distance_km,
+            "path": path_with_coords
+        })
