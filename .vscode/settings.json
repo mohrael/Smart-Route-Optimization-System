@@ -14,5 +14,7 @@
       ]
     }
   },
-  "terminal.integrated.defaultProfile.windows": "PowerShell (Delivery Route venv)"
+  "terminal.integrated.defaultProfile.windows": "PowerShell (Delivery Route venv)",
+  "python-envs.defaultEnvManager": "ms-python.python:venv",
+  "python-envs.defaultPackageManager": "ms-python.python:pip"
 }

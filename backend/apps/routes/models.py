@@ -6,12 +6,14 @@ from django.conf import settings
 
 class RouteRequest(models.Model):
     user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
-    start_location = models.ForeignKey(Location, on_delete=models.CASCADE)
+    start_lat = models.FloatField()
+    start_lon = models.FloatField()
     timestamp = models.DateTimeField(auto_now_add=True)
     
 class RouteRequestDestination(models.Model):
     route_request = models.ForeignKey(RouteRequest, on_delete=models.CASCADE)
-    location = models.ForeignKey(Location, on_delete=models.CASCADE)
+    lat = models.FloatField()
+    lon = models.FloatField()
     
 class RouteResult(models.Model):
     class AlgorithmChoices(models.TextChoices):
