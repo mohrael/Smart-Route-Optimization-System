@@ -19,11 +19,12 @@ class RouteResult(models.Model):
     class AlgorithmChoices(models.TextChoices):
         DIJKSTRA = 'DIJKSTRA', 'Dijkstra (Shortest Path)'
         A_STAR = 'A_STAR', 'A* (Heuristic Search)'
-        
+        TSP_APPROX = 'TSP_APPROX'
+
     route_request = models.OneToOneField(RouteRequest, on_delete=models.CASCADE)
     total_cost = models.FloatField()
     path = models.JSONField(default=list)  # Store path as list of node IDs
-    algorithm_used = models.CharField(max_length=8, choices=AlgorithmChoices.choices, default=AlgorithmChoices.DIJKSTRA)
+    algorithm_used = models.CharField(max_length=10, choices=AlgorithmChoices.choices, default=AlgorithmChoices.DIJKSTRA)
     execution_time = models.DurationField()
     
     

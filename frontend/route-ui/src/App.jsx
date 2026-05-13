@@ -1,7 +1,7 @@
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useRef, useCallback } from 'react'
 import MapComponent from './MapComponent'
 
-const TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ0b2tlbl90eXBlIjoiYWNjZXNzIiwiZXhwIjoxNzc4NDI4MzcxLCJpYXQiOjE3NzgzNDE5NzEsImp0aSI6IjRkNDRhZDM3ZTkzNjQ0YmE5YjliNjY4NTI4YWIyMDM1IiwidXNlcl9pZCI6IjEifQ.uu4P1k2a6lJcXHXot2let-9gC0bWdUxS1aLgDoBWr2M"
+const TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ0b2tlbl90eXBlIjoiYWNjZXNzIiwiZXhwIjoxNzc4Nzc3ODY4LCJpYXQiOjE3Nzg2OTE0NjgsImp0aSI6ImM1ZTA1M2ZlYjg2MzQxOGQ5Y2U0ZGQ3MGM1YzYwZTA2IiwidXNlcl9pZCI6IjEifQ.Lg14oxQ2svRL-aUqqnshCMcNTd4D6P2SeR0xUJtHqDQ"
 
 const locLabel = (loc) => {
   if (!loc) return ''
@@ -20,17 +20,166 @@ export default function App() {
   const [locations, setLocations]         = useState([])
   const [pathLocation, setPathLocation]   = useState([])
   const [totalDistance, setTotalDistance] = useState(null)
+  const [etaMinutes, setEtaMinutes]       = useState(null)
+  const [distanceMeters, setDistanceMeters] = useState(null)
   const [roadPath, setRoadPath]           = useState([])
   const [search, setSearch]               = useState('')
   const [searchLoading, setSearchLoading] = useState(false)
   const [panelOpen, setPanelOpen]         = useState(true)
   const [userLocation, setUserLocation]   = useState(null)
-  const [directions, setDirections]       = useState([]) // Holds text instructions
-  const [isTracking, setIsTracking]       = useState(false) // Toggle tracking on/off
-  const watchIdRef                        = useRef(null) // Keeps track of the GPS sensor
+  const [directions, setDirections]       = useState([])
+  const [isTracking, setIsTracking]       = useState(false)
+  const watchIdRef                        = useRef(null)
+  const mapRef                            = useRef(null)
+  const [history, setHistory]             = useState([])
+  const [selectedRoute, setSelectedRoute] = useState(null)
+  const [historyOpen, setHistoryOpen] = useState(false)
+  const [algorithm, setAlgorithm] = useState('TSP')
+  const [needsRecalc, setNeedsRecalc] = useState(false)
+
+  // --- NEW STATES FOR THE UI UPGRADE ---
+  const [activeTab, setActiveTab] = useState('route')
+  const [favorites, setFavorites] = useState([])
+  const [voiceEnabled, setVoiceEnabled] = useState(false)
+  const [shareUrl, setShareUrl] = useState('') // Set this when a route is successfully fetched
+  const TABS = ['route', 'favorites', 'history']
+
+  // --- NEW HELPERS ---
+  const saveFavorite = (loc) => {
+    if (!loc) return
+    setFavorites(prev => {
+      const exists = prev.some(f => Math.abs(f.lat - loc.lat) < 0.0001 && Math.abs(f.lon - loc.lon) < 0.0001)
+      if (!exists) return [...prev, loc]
+      return prev
+    })
+  }
+  const removeFavorite = (lat, lon) => {
+    setFavorites(prev => prev.filter(f => Math.abs(f.lat - lat) >= 0.0001 || Math.abs(f.lon - lon) >= 0.0001))
+  }
+
+  // // ── favorites ────────────────────────────────────────────────────────────────
+  // const saveFavorite = (loc) => {
+  //   const fav = { ...loc, savedAt: new Date().toLocaleDateString() }
+  //   const updated = [fav, ...favorites.filter(f => !(f.lat === loc.lat && f.lon === loc.lon))].slice(0, 50)
+  //   setFavorites(updated)
+  //   localStorage.setItem('favorites', JSON.stringify(updated))
+  // }
+
+  // const removeFavorite = (lat, lon) => {
+  //   const updated = favorites.filter(f => !(f.lat === lat && f.lon === lon))
+  //   setFavorites(updated)
+  //   localStorage.setItem('favorites', JSON.stringify(updated))
+  // }
+
+  const etaFromKm = (km) => {
+    const mins = Math.round(Number(km) * 2.5); // Rough city estimate: 2.5 mins per km
+    if (mins < 60) return `${mins} min`
+    const hrs = Math.floor(mins / 60)
+    return `${hrs}h ${mins % 60}m`
+  }
+
+  const ETA_TRAFFIC_FACTOR = 1.4
+
+  const etaFromMinutes = (mins) => {
+    const safeMins = Math.max(0, Math.round(Number(mins) * ETA_TRAFFIC_FACTOR))
+    if (safeMins < 60) return `${safeMins} min`
+    const hrs = Math.floor(safeMins / 60)
+    return `${hrs}h ${safeMins % 60}m`
+  }
+
+  const formatDistance = (km) => {
+    if (km == null || Number.isNaN(Number(km))) return { value: '—', unit: '' }
+    const safeKm = Number(km)
+    if (safeKm < 1) return { value: `${Math.round(safeKm * 1000)}`, unit: 'm' }
+    return { value: `${safeKm}`, unit: 'km' }
+  }
+
+  const formatDistanceMeters = (meters) => {
+    if (meters == null || Number.isNaN(Number(meters))) return { value: '—', unit: '' }
+    const safeMeters = Math.max(0, Math.round(Number(meters)))
+    if (safeMeters < 1000) return { value: `${safeMeters}`, unit: 'm' }
+    return { value: `${(safeMeters / 1000).toFixed(2)}`, unit: 'km' }
+  }
+
+  const haversineKm = (a, b) => {
+    const R = 6371, dLat = (b.lat - a.lat) * Math.PI / 180, dLon = (b.lon - a.lon) * Math.PI / 180
+    const x = Math.sin(dLat/2)**2 + Math.cos(a.lat*Math.PI/180)*Math.cos(b.lat*Math.PI/180)*Math.sin(dLon/2)**2
+    return R * 2 * Math.atan2(Math.sqrt(x), Math.sqrt(1-x))
+  }
+
+  // const speak = (text) => {
+  //   if (!window.speechSynthesis) return
+  //   window.speechSynthesis.cancel()
+  //   const u = new SpeechSynthesisUtterance(text)
+  //   u.lang = 'en-US'; u.rate = 0.95
+  //   window.speechSynthesis.speak(u)
+  // }
+  // async function reverseGeocode(lat, lon) {
+  //   try {
+  //     const res = await fetch(`https://nominatim.openstreetmap.org/reverse?format=json&lat=${lat}&lon=${lon}&zoom=18&addressdetails=1`)
+  //     const d = await res.json()
+  //     const a = d.address || {}
+  //     return {
+  //       street: a.road || a.pedestrian || a.path || '',
+  //       area:   a.neighbourhood || a.suburb || a.quarter || '',
+  //       city:   a.city || a.town || a.village || a.county || '',
+  //       display: [a.road, a.neighbourhood || a.suburb, a.city || a.town].filter(Boolean).join(', ') || d.display_name?.split(',')[0] || 'Unknown location'
+  //     }
+  //   } catch { return { street: '', area: '', city: '', display: 'Unknown location' } }
+  // }
+
+    async function reverseGeocode(lat, lon) {
+    try {
+      const res = await fetch(`https://nominatim.openstreetmap.org/reverse?format=json&lat=${lat}&lon=${lon}&zoom=18&addressdetails=1`)
+      const d = await res.json()
+      const a = d.address || {}
+      return {
+        street: a.road || a.pedestrian || a.path || '',
+        area: a.neighbourhood || a.suburb || a.quarter || '',
+        city: a.city || a.town || a.village || a.county || '',
+        display: [a.road, a.neighbourhood || a.suburb, a.city || a.town].filter(Boolean).join(', ') || d.display_name?.split(',')[0] || 'Unknown location'
+      }
+    } catch {
+      return { street: '', area: '', city: '', display: 'Unknown location' }
+    }
+  }
 
 
+  
+  const loadRoute = async (route) => {
+    // Restore start/dest as loc objects
+    const start = {
+      lat: route.start_location.lat,
+      lon: route.start_location.lon,
+      name: `${route.start_location.lat.toFixed(4)}, ${route.start_location.lon.toFixed(4)}`
+    }
+    const dests = (route.destinations || []).map(d => ({
+      lat: d.lat,
+      lon: d.lon,
+      name: `${d.lat.toFixed(4)}, ${d.lon.toFixed(4)}`
+    }))
 
+    setStartLocation(start)
+    setDestinations(dests)
+    setTotalDistance(route.stats?.total_distance_km ?? null)
+
+    // Use saved road path if available, otherwise re-fetch from OSRM
+    if (route.road_path?.length > 0) {
+      setRoadPath(route.road_path)
+    } else {
+      const rp = await fetchRoadPath(start, dests)
+      setRoadPath(rp)
+    }
+
+    // Use saved directions if available
+    if (route.directions?.length > 0) {
+      setDirections(route.directions)
+    }
+
+    // Set a fake result so the result panel shows
+    setResult({ id: null, total_distance_km: route.stats?.total_distance_km })
+    setHistoryOpen(false)
+  }
   async function loadLocations() {
     try {
       const res = await fetch('http://127.0.0.1:8000/location/get_locations/', {
@@ -39,6 +188,19 @@ export default function App() {
       const data = await res.json()
       if (res.ok) setLocations(data)
     } catch { /* silent */ }
+  }
+
+  async function loadHistory() {
+    try {
+      const res = await fetch("http://127.0.0.1:8000/routes/history/", {
+        headers: { Authorization: `Bearer ${TOKEN}` }
+      })
+      const data = await res.json()
+      console.log("History response:", data)
+      setHistory(data)
+    } catch {
+      console.error("Failed to load history")
+    }
   }
 
   async function fetchPathLocations(id) {
@@ -57,13 +219,16 @@ export default function App() {
   async function fetchRoadPath(start, dests) {
     try {
       const coords = [start, ...dests].map(p => `${p.lon},${p.lat}`).join(';')
-      
-      // We added &steps=true to the end of this URL!
       const res = await fetch(
         `https://router.project-osrm.org/route/v1/driving/${coords}?overview=full&geometries=geojson&steps=true`
       )
       const data = await res.json()
       if (data.code !== 'Ok' || !data.routes?.[0]) return []
+
+      const durationSec = data.routes[0].duration
+      setEtaMinutes(durationSec != null ? durationSec / 60 : null)
+      const distanceSec = data.routes[0].distance
+      setDistanceMeters(distanceSec != null ? distanceSec : null)
 
       const steps = data.routes[0].legs.flatMap(leg => leg.steps)
       const parsedDirections = steps.map((step, index) => {
@@ -71,112 +236,56 @@ export default function App() {
         const road = step.name ? `onto ${step.name}` : 'ahead'
         const dist = step.distance > 1000 ? `${(step.distance / 1000).toFixed(1)} km` : `${step.distance.toFixed(0)} m`
         return { id: index, text: `${action} ${road}`, dist }
-      }).filter(d => d.text !== 'arrive ahead') 
-      
-      setDirections(parsedDirections)
+      }).filter(d => d.text !== 'arrive ahead')
 
+      setDirections(parsedDirections)
       return data.routes[0].geometry.coordinates.map(([lon, lat]) => [lat, lon])
     } catch { return [] }
   }
+
   useEffect(() => {
     loadLocations()
-    // getCurrentLocation()
+    loadHistory()
   }, [])
 
   const resetRoute = () => {
     setPathLocation([])
     setResult(null)
     setTotalDistance(null)
+    setEtaMinutes(null)
+    setDistanceMeters(null)
     setError('')
     setRoadPath([])
+    setNeedsRecalc(false)
+    setDirections([])
   }
-  // const getCurrentLocation = async () => {
-  //   if (!navigator.geolocation) {
-  //     setError('Geolocation is not supported')
-  //     return
-  //   }
 
-  //   setSearchLoading(true) 
+  const handleSelectRoute = async (route) => {
+    setSelectedRoute(route)
+    await loadRoute(route)
+  }
 
-  //   navigator.geolocation.getCurrentPosition(
-  //     async (position) => {
-  //       const lat = position.coords.latitude;
-  //       const lon = position.coords.longitude;
-  //       let placeName = 'My Location'; // Fallback name
-
-  //       try {
-  //         const res = await fetch(`https://nominatim.openstreetmap.org/reverse?format=json&lat=${lat}&lon=${lon}&zoom=18&addressdetails=1`);
-  //         const data = await res.json();
-          
-  //         if (data && data.address) {
-  //           placeName = data.address.road || data.address.neighbourhood || data.address.suburb || data.name || 'My Location';
-  //         }
-  //       } catch (err) {
-  //         console.error("Could not fetch street name:", err);
-  //       }
-
-  //       const loc = { 
-  //         name: placeName,
-  //         lat: lat, 
-  //         lon: lon 
-  //       }
-
-  //       setUserLocation(loc)
-  //       handleSelectLocation(loc)
-  //       setSearchLoading(false)
-  //     },
-  //     (err) => {
-  //       setSearchLoading(false)
-  //       console.error(err)
-  //       switch(err.code) {
-  //         case 1: setError('Location permission denied.'); break;
-  //         case 2: setError('Position unavailable. Ensure GPS is on.'); break;
-  //         case 3: setError('Location request timed out.'); break;
-  //         default: setError('Unknown location error.'); break;
-  //       }
-  //     },
-  //     {
-  //       enableHighAccuracy: true,
-  //       timeout: 10000,
-  //       maximumAge: 0,
-  //     }
-  //   )
-  // }
-
-const toggleTracking = async () => {
+  const toggleTracking = async () => {
     if (!navigator.geolocation) {
       setError('Geolocation is not supported')
       return
     }
-
-    // Optional: Set loading state so the user knows it's thinking
-    setSearchLoading(true) 
-
+    setSearchLoading(true)
     navigator.geolocation.getCurrentPosition(
       async (position) => {
-        const lat = position.coords.latitude;
-        const lon = position.coords.longitude;
-        let placeName = 'My Location'; // Fallback name
-
-        // ⚡ REVERSE GEOCODING: Ask OpenStreetMap for the street name
+        const lat = position.coords.latitude
+        const lon = position.coords.longitude
+        let placeName = 'My Location'
         try {
-          const res = await fetch(`https://nominatim.openstreetmap.org/reverse?format=json&lat=${lat}&lon=${lon}&zoom=18&addressdetails=1`);
-          const data = await res.json();
-          
-          if (data && data.address) {
-            // Try to get the most relevant local name (Road, Neighborhood, or Suburb)
-            placeName = data.address.road || data.address.neighbourhood || data.address.suburb || data.name || 'My Location';
+          const res = await fetch(`https://nominatim.openstreetmap.org/reverse?format=json&lat=${lat}&lon=${lon}&zoom=18&addressdetails=1`)
+          const data = await res.json()
+          if (data?.address) {
+            placeName = data.address.road || data.address.neighbourhood || data.address.suburb || data.name || 'My Location'
           }
         } catch (err) {
-          console.error("Could not fetch street name:", err);
+          console.error("Could not fetch street name:", err)
         }
-
-        const loc = { 
-          name: placeName, // Now it uses the real street name!
-          lat: lat, 
-          lon: lon 
-        }
-
+        const loc = { name: placeName, lat, lon }
         setUserLocation(loc)
         handleSelectLocation(loc)
         setSearchLoading(false)
@@ -184,57 +293,120 @@ const toggleTracking = async () => {
       (err) => {
         setSearchLoading(false)
         console.error(err)
-        switch(err.code) {
-          case 1: setError('Location permission denied.'); break;
-          case 2: setError('Position unavailable. Ensure GPS is on.'); break;
-          case 3: setError('Location request timed out.'); break;
-          default: setError('Unknown location error.'); break;
+        switch (err.code) {
+          case 1: setError('Location permission denied.'); break
+          case 2: setError('Position unavailable. Ensure GPS is on.'); break
+          case 3: setError('Location request timed out.'); break
+          default: setError('Unknown location error.'); break
         }
       },
-      {
-        enableHighAccuracy: true,
-        timeout: 10000,
-        maximumAge: 0,
-      }
+      { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }
     )
-  }  
-  const handleSelectLocation = (loc) => {
+  }
+
+  const handleSelectLocation = useCallback(async (loc) => {
+
+    // -----------------------------------
+    // Step 1: enrich raw coordinates
+    // -----------------------------------
+
+    let enriched = loc
+
+    const hasName =
+      loc.name ||
+      loc.street
+
+    if (!hasName && loc.lat && loc.lon) {
+      try {
+        const geo = await reverseGeocode(loc.lat, loc.lon)
+
+        enriched = {
+          ...loc,
+          ...geo,
+          name: geo.display,
+        }
+
+      } catch (err) {
+        console.error("Reverse geocoding failed:", err)
+      }
+    }
+
+    // -----------------------------------
+    // Step 2: first selected point = start
+    // -----------------------------------
+
     if (!startLocation) {
-      setStartLocation(loc)
+      setStartLocation(enriched)
       resetRoute()
       return
     }
+
+    // -----------------------------------
+    // Step 3: clicking same start removes route
+    // -----------------------------------
+
     const isSameAsStart = startLocation.id
-      ? startLocation.id === loc.id
-      : startLocation.lat === loc.lat && startLocation.lon === loc.lon
+      ? startLocation.id === enriched.id
+      : (
+          startLocation.lat === enriched.lat &&
+          startLocation.lon === enriched.lon
+        )
+
     if (isSameAsStart) {
       setStartLocation(null)
       setDestinations([])
       resetRoute()
       return
     }
+
+    // -----------------------------------
+    // Step 4: toggle destination
+    // -----------------------------------
+
     setDestinations(prev => {
+
       const exists = prev.some(d =>
-        d.id ? d.id === loc.id : d.lat === loc.lat && d.lon === loc.lon
+        d.id
+          ? d.id === enriched.id
+          : (
+              d.lat === enriched.lat &&
+              d.lon === enriched.lon
+            )
       )
-      return exists
-        ? prev.filter(d => d.id ? d.id !== loc.id : !(d.lat === loc.lat && d.lon === loc.lon))
-        : [...prev, loc]
+
+      if (exists) {
+        return prev.filter(d =>
+          d.id
+            ? d.id !== enriched.id
+            : !(
+                d.lat === enriched.lat &&
+                d.lon === enriched.lon
+              )
+        )
+      }
+
+      return [...prev, enriched]
     })
+
     resetRoute()
-  }
+
+  }, [startLocation])
 
   const handleSearch = async () => {
     if (!search.trim()) return
     setSearchLoading(true)
     try {
       const res = await fetch(
-        `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(search)}&limit=1`
+        `http://127.0.0.1:8000/routes/search-location/?q=${encodeURIComponent(search)}`,
       )
       const data = await res.json()
       if (data.length === 0) { setError('Place not found.'); return }
-      const place = data[0]
-      handleSelectLocation({ name: place.display_name, lat: Number(place.lat), lon: Number(place.lon) })
+      const place = data
+      handleSelectLocation({
+        name: place.name,
+        lat: Number(place.lat),
+        lon: Number(place.lon)
+      })
       setSearch('')
     } catch { setError('Search failed.') }
     finally { setSearchLoading(false) }
@@ -246,7 +418,7 @@ const toggleTracking = async () => {
     setPathLocation([])
     setLoading(true)
 
-    if (!startLocation) { setError('Set a start point first.'); setLoading(false); return }
+    if (!startLocation) { setError('Set a start point.'); setLoading(false); return }
     const validDests = destinations.filter(d => d?.lat != null && d?.lon != null)
     if (validDests.length === 0) { setError('Add at least one destination.'); setLoading(false); return }
 
@@ -257,18 +429,18 @@ const toggleTracking = async () => {
         body: JSON.stringify({
           start_location: { lat: startLocation.lat, lon: startLocation.lon },
           destinations: validDests.map(d => ({ lat: d.lat, lon: d.lon })),
+          algorithm: algorithm,
         }),
       })
       const data = await res.json()
       if (!res.ok) { setError(data?.detail || data?.error || 'Request failed.'); return }
       setResult(data)
+      setNeedsRecalc(false)
       if (data.id) await fetchPathLocations(data.id)
       setRoadPath(await fetchRoadPath(startLocation, validDests))
     } catch { setError('Network error. Check backend server.') }
     finally { setLoading(false) }
   }
-
-  const hasRoute = roadPath.length > 0 || pathLocation.length > 0
 
   return (
     <div style={{ position: 'relative', width: '100vw', height: '100vh', overflow: 'hidden', fontFamily: "'DM Sans', system-ui, sans-serif", background: '#0f172a' }}>
@@ -283,21 +455,22 @@ const toggleTracking = async () => {
           destinations={destinations}
           onSelectLocation={handleSelectLocation}
           userLocation={userLocation}
+          onMapReady={(map) => { mapRef.current = map }}
         />
       </div>
 
       {/* Top search bar */}
       <div style={{
         position: 'absolute', top: 16, left: '50%', transform: 'translateX(-50%)',
-        width: 'min(520px, calc(100vw - 32px))',
-        background: 'rgba(15,23,42,0.92)', backdropFilter: 'blur(16px)',
+        width: 'min(560px, calc(100vw - 32px))',
+        background: 'rgba(15,23,42,0.93)', backdropFilter: 'blur(20px)',
         borderRadius: 14, border: '1px solid rgba(255,255,255,0.1)',
         boxShadow: '0 8px 32px rgba(0,0,0,0.4)',
         display: 'flex', alignItems: 'center', gap: 8, padding: '10px 14px',
         zIndex: 1000,
       }}>
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#64748b" strokeWidth="2">
-          <circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/>
+          <circle cx="11" cy="11" r="8" /><path d="m21 21-4.35-4.35" />
         </svg>
         <input
           type="text"
@@ -310,6 +483,25 @@ const toggleTracking = async () => {
             color: '#f1f5f9', fontSize: 14, caretColor: '#3b82f6',
           }}
         />
+        
+        {/* choose algorithm if Greedy or TSP */}
+        <select
+          value={algorithm}
+          onChange={e => {
+            const next = e.target.value
+            setAlgorithm(next)
+            if (result) setNeedsRecalc(true)
+          }}
+          style={{
+            marginLeft: 8, background: 'rgba(255,255,255,0.07)', border: '1px solid rgba(255,255,255,0.12)',
+            color: '#f1f5f9', fontSize: 12, borderRadius: 8, padding: '5px 10px',
+            cursor: 'pointer',
+          }}
+        >
+          <option value="TSP" style={{ color: '#0f172a' }}>TSP (Exact)</option>
+          <option value="GREEDY" style={{ color: '#0f172a' }}>Greedy (Fast)</option>
+        </select>
+
         {search && (
           <button
             onClick={handleSearch}
@@ -325,7 +517,7 @@ const toggleTracking = async () => {
         )}
       </div>
 
-      {/* Mode hint when nothing selected */}
+      {/* Mode hints */}
       {!startLocation && (
         <div style={{
           position: 'absolute', top: 76, left: '50%', transform: 'translateX(-50%)',
@@ -347,6 +539,60 @@ const toggleTracking = async () => {
         </div>
       )}
 
+      {/* Map zoom buttons */}
+      <div
+        style={{
+          position: 'absolute',
+          right: 20,
+          bottom: panelOpen ? 372 : 90,
+          display: 'flex',
+          flexDirection: 'column',
+          gap: 8,
+          zIndex: 1001,
+        }}
+      >
+        <button
+          onClick={() => mapRef.current?.zoomIn()}
+          disabled={!mapRef.current}
+          style={{
+            width: 40,
+            height: 40,
+            borderRadius: 12,
+            background: 'rgba(15,23,42,0.92)',
+            backdropFilter: 'blur(12px)',
+            border: '1px solid rgba(255,255,255,0.12)',
+            color: '#e2e8f0',
+            fontSize: 18,
+            cursor: mapRef.current ? 'pointer' : 'not-allowed',
+            opacity: mapRef.current ? 1 : 0.5,
+            boxShadow: '0 4px 16px rgba(0,0,0,0.3)',
+          }}
+          aria-label="Zoom in"
+        >
+          +
+        </button>
+        <button
+          onClick={() => mapRef.current?.zoomOut()}
+          disabled={!mapRef.current}
+          style={{
+            width: 40,
+            height: 40,
+            borderRadius: 12,
+            background: 'rgba(15,23,42,0.92)',
+            backdropFilter: 'blur(12px)',
+            border: '1px solid rgba(255,255,255,0.12)',
+            color: '#e2e8f0',
+            fontSize: 18,
+            cursor: mapRef.current ? 'pointer' : 'not-allowed',
+            opacity: mapRef.current ? 1 : 0.5,
+            boxShadow: '0 4px 16px rgba(0,0,0,0.3)',
+          }}
+          aria-label="Zoom out"
+        >
+          −
+        </button>
+      </div>
+
       {/* Bottom panel toggle button */}
       <button
         onClick={() => setPanelOpen(p => !p)}
@@ -354,12 +600,9 @@ const toggleTracking = async () => {
           position: 'absolute', bottom: panelOpen ? 308 : 20, right: 20,
           width: 44, height: 44, borderRadius: '50%',
           background: 'rgba(15,23,42,0.92)', backdropFilter: 'blur(12px)',
-          border: '1px solid rgba(255,255,255,0.12)',
-          color: '#94a3b8', fontSize: 18, cursor: 'pointer',
+          border: '1px solid rgba(255,255,255,0.12)', color: '#94a3b8', fontSize: 18, cursor: 'pointer',
           display: 'flex', alignItems: 'center', justifyContent: 'center',
-          boxShadow: '0 4px 16px rgba(0,0,0,0.3)',
-          transition: 'bottom 0.35s cubic-bezier(0.4,0,0.2,1)',
-          zIndex: 1001,
+          boxShadow: '0 4px 16px rgba(0,0,0,0.3)', transition: 'bottom 0.35s cubic-bezier(0.4,0,0.2,1)', zIndex: 1001,
         }}
       >
         {panelOpen ? '↓' : '↑'}
@@ -367,158 +610,282 @@ const toggleTracking = async () => {
 
       {/* Bottom slide-up panel */}
       <div style={{
-        position: 'absolute', bottom: 0, left: 0, right: 0,
-        height: 300,
+        position: 'absolute', bottom: 0, left: 0, right: 0, height: 300,
         transform: panelOpen ? 'translateY(0)' : 'translateY(100%)',
         transition: 'transform 0.35s cubic-bezier(0.4,0,0.2,1)',
-        background: 'rgba(15,23,42,0.96)', backdropFilter: 'blur(24px)',
-        borderTop: '1px solid rgba(255,255,255,0.08)',
-        borderRadius: '20px 20px 0 0',
-        zIndex: 1000,
-        display: 'flex', flexDirection: 'column',
+        background: 'rgba(15,23,42,0.97)', backdropFilter: 'blur(24px)',
+        borderTop: '1px solid rgba(255,255,255,0.08)', borderRadius: '20px 20px 0 0',
+        zIndex: 1000, display: 'flex', flexDirection: 'column',
       }}>
         {/* Drag handle */}
         <div style={{ display: 'flex', justifyContent: 'center', padding: '12px 0 4px' }}>
           <div style={{ width: 36, height: 4, borderRadius: 2, background: 'rgba(255,255,255,0.2)' }} />
         </div>
 
+        {/* Tabs */}
+        <div style={{ display: 'flex', gap: 4, padding: '0 20px 10px' }}>
+          {TABS.map(tab => (
+            <button key={tab} onClick={() => setActiveTab(tab)} style={{
+              flex: 1, padding: '6px 0', fontSize: 12, fontWeight: 600, borderRadius: 8, border: 'none', cursor: 'pointer',
+              background: activeTab === tab ? 'rgba(59,130,246,0.2)' : 'rgba(255,255,255,0.05)',
+              color: activeTab === tab ? '#3b82f6' : '#64748b',
+              textTransform: 'capitalize',
+            }}>
+              {tab === 'route' ? '🗺 Route' : tab === 'favorites' ? '⭐ Saved' : '🕒 History'}
+            </button>
+          ))}
+        </div>
+
         <div style={{ flex: 1, overflowY: 'auto', padding: '0 20px 20px', display: 'flex', gap: 16 }}>
 
-          {/* Left: waypoints */}
-          <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: 8 }}>
-
-            {/* Start row */}
-            {startLocation ? (
-              <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-                <div style={{ width: 10, height: 10, borderRadius: '50%', background: PIN_COLORS.start, flexShrink: 0, boxShadow: `0 0 8px ${PIN_COLORS.start}` }} />
-                <span style={{ flex: 1, fontSize: 13, color: '#f1f5f9', fontWeight: 500, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                  {locLabel(startLocation)}
-                </span>
-                <button onClick={() => { setStartLocation(null); setDestinations([]); resetRoute() }}
-                  style={{ background: 'none', border: 'none', color: '#64748b', cursor: 'pointer', fontSize: 16, padding: '0 4px' }}>×</button>
-              </div>
-            ) : (
-              <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-                <div style={{ width: 10, height: 10, borderRadius: '50%', border: `2px dashed ${PIN_COLORS.start}`, flexShrink: 0 }} />
-                <span style={{ fontSize: 13, color: '#475569' }}>Tap map to set start</span>
-              </div>
-            )}
-
-            {/* Connector line */}
-            {(startLocation || destinations.length > 0) && (
-              <div style={{ width: 1, height: 8, background: 'rgba(255,255,255,0.1)', marginLeft: 4 }} />
-            )}
-
-            {/* Destinations */}
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 6, maxHeight: 120, overflowY: 'auto' }}>
-              {destinations.map((dest, i) => (
-                <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-                  <div style={{
-                    width: 10, height: 10, borderRadius: '50%', flexShrink: 0,
-                    background: i === destinations.length - 1 ? PIN_COLORS.end : PIN_COLORS.dest,
-                    boxShadow: `0 0 8px ${i === destinations.length - 1 ? PIN_COLORS.end : PIN_COLORS.dest}`,
-                  }} />
-                  <span style={{ flex: 1, fontSize: 13, color: '#cbd5e1', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                    {locLabel(dest)}
-                  </span>
-                  <button onClick={() => { setDestinations(p => p.filter((_, j) => j !== i)); resetRoute() }}
-                    style={{ background: 'none', border: 'none', color: '#64748b', cursor: 'pointer', fontSize: 16, padding: '0 4px' }}>×</button>
-                </div>
-              ))}
-              {destinations.length === 0 && startLocation && (
-                <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-                  <div style={{ width: 10, height: 10, borderRadius: '50%', border: `2px dashed ${PIN_COLORS.end}`, flexShrink: 0 }} />
-                  <span style={{ fontSize: 13, color: '#475569' }}>Tap map to add destinations</span>
-                </div>
-              )}
-            </div>
-          </div>
-
-          {/* Divider */}
-          <div style={{ width: 1, background: 'rgba(255,255,255,0.07)', flexShrink: 0 }} />
-
-          {/* Right: action + result */}
-          <div style={{ width: 180, display: 'flex', flexDirection: 'column', gap: 12, justifyContent: 'center' }}>
-            {/* user location */}
-            <button
-              onClick={toggleTracking}
-              style={{
-                background: isTracking ? 'rgba(239,68,68,0.1)' : 'rgba(34,197,94,0.1)', 
-                border: `1px solid ${isTracking ? 'rgba(239,68,68,0.25)' : 'rgba(34,197,94,0.25)'}`,
-                borderRadius: 10, 
-                color: isTracking ? '#ef4444' : '#22c55e', 
-                fontSize: 12, fontWeight: 600,
-                padding: '8px 0', cursor: 'pointer', width: '100%',
-                display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6,
-              }}
-            >
-              <div style={{
-                width: 8, height: 8, borderRadius: '50%', background: 'currentColor',
-                animation: isTracking ? 'ping 1.5s cubic-bezier(0, 0, 0.2, 1) infinite' : 'none'
-              }} />
-              {isTracking ? 'Stop Tracking' : 'Start Live Tracking'}
-            </button>    
-            {result ? (
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-                <div style={{ display: 'flex', gap: 10 }}>
-                  <div style={{ flex: 1, background: 'rgba(59,130,246,0.1)', border: '1px solid rgba(59,130,246,0.2)', borderRadius: 10, padding: '10px 12px', textAlign: 'center' }}>
-                    <div style={{ fontSize: 11, color: '#64748b', marginBottom: 2, textTransform: 'uppercase', letterSpacing: '0.06em' }}>Distance</div>
-                    <div style={{ fontSize: 18, fontWeight: 700, color: '#3b82f6' }}>
-                      {totalDistance != null ? `${totalDistance}` : '—'}
+          {/* ── ROUTE TAB ── */}
+          {activeTab === 'route' && (
+            <>
+              {/* Left: waypoints */}
+              <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: 8 }}>
+                {/* Start */}
+                {startLocation ? (
+                  <div style={{ display: 'flex', alignItems: 'flex-start', gap: 10 }}>
+                    <div style={{ width: 10, height: 10, borderRadius: '50%', background: PIN_COLORS.start, flexShrink: 0, marginTop: 3, boxShadow: `0 0 8px ${PIN_COLORS.start}` }} />
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div style={{ fontSize: 13, color: '#f1f5f9', fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                        {startLocation.street || locLabel(startLocation)}
+                      </div>
+                      {(startLocation.area || startLocation.city) && (
+                        <div style={{ fontSize: 11, color: '#64748b' }}>{[startLocation.area, startLocation.city].filter(Boolean).join(', ')}</div>
+                      )}
                     </div>
-                    <div style={{ fontSize: 11, color: '#475569' }}>km</div>
+                    <button onClick={() => saveFavorite(startLocation)} title="Save" style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: 14 }}>⭐</button>
+                    <button onClick={() => { setStartLocation(null); setDestinations([]); resetRoute() }} style={{ background: 'none', border: 'none', color: '#64748b', cursor: 'pointer', fontSize: 16, padding: '0 2px' }}>×</button>
                   </div>
-                  <div style={{ flex: 1, background: 'rgba(34,197,94,0.1)', border: '1px solid rgba(34,197,94,0.2)', borderRadius: 10, padding: '10px 12px', textAlign: 'center' }}>
-                    <div style={{ fontSize: 11, color: '#64748b', marginBottom: 2, textTransform: 'uppercase', letterSpacing: '0.06em' }}>Stops</div>
-                    <div style={{ fontSize: 18, fontWeight: 700, color: '#22c55e' }}>{destinations.length}</div>
-                    <div style={{ fontSize: 11, color: '#475569' }}>points</div>
+                ) : (
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                    <div style={{ width: 10, height: 10, borderRadius: '50%', border: `2px dashed ${PIN_COLORS.start}`, flexShrink: 0 }} />
+                    <span style={{ fontSize: 13, color: '#475569' }}>Tap map to set start</span>
                   </div>
+                )}
+
+                {(startLocation || destinations.length > 0) && <div style={{ width: 1, height: 6, background: 'rgba(255,255,255,0.1)', marginLeft: 4 }} />}
+
+                {/* Destinations */}
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 6, maxHeight: 100, overflowY: 'auto' }}>
+                  {destinations.map((dest, i) => (
+                    <div key={i} style={{ display: 'flex', alignItems: 'flex-start', gap: 10 }}>
+                      <div style={{ width: 10, height: 10, borderRadius: '50%', flexShrink: 0, marginTop: 3, background: i === destinations.length - 1 ? PIN_COLORS.end : PIN_COLORS.dest, boxShadow: `0 0 6px ${i === destinations.length - 1 ? PIN_COLORS.end : PIN_COLORS.dest}` }} />
+                      <div style={{ flex: 1, minWidth: 0 }}>
+                        <div style={{ fontSize: 13, color: '#cbd5e1', fontWeight: 500, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                          {dest.street || locLabel(dest)}
+                        </div>
+                        {(dest.area || dest.city) && <div style={{ fontSize: 11, color: '#64748b' }}>{[dest.area, dest.city].filter(Boolean).join(', ')}</div>}
+                      </div>
+                      <button onClick={() => saveFavorite(dest)} title="Save" style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: 14 }}>⭐</button>
+                      <button onClick={() => { setDestinations(p => p.filter((_, j) => j !== i)); resetRoute() }} style={{ background: 'none', border: 'none', color: '#64748b', cursor: 'pointer', fontSize: 16, padding: '0 2px' }}>×</button>
+                    </div>
+                  ))}
+                  {!destinations.length && startLocation && (
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                      <div style={{ width: 10, height: 10, borderRadius: '50%', border: `2px dashed ${PIN_COLORS.end}`, flexShrink: 0 }} />
+                      <span style={{ fontSize: 13, color: '#475569' }}>Tap to add destinations</span>
+                    </div>
+                  )}
                 </div>
-                <button
-                  onClick={() => { setStartLocation(null); setDestinations([]); resetRoute() }}
-                  style={{
-                    background: 'rgba(239,68,68,0.15)', border: '1px solid rgba(239,68,68,0.3)',
-                    borderRadius: 10, color: '#ef4444', fontSize: 13, fontWeight: 600,
-                    padding: '9px 0', cursor: 'pointer', width: '100%',
-                  }}
-                >
-                  Clear route
-                </button>
+
+                {/* Directions */}
                 {directions.length > 0 && (
-                  <div style={{ marginTop: 12, display: 'flex', flexDirection: 'column', gap: 8, maxHeight: 150, overflowY: 'auto', paddingRight: 4 }}>
-                    <div style={{ fontSize: 11, color: '#64748b', textTransform: 'uppercase', letterSpacing: '0.06em', fontWeight: 700 }}>Directions</div>
-                    {directions.map((dir) => (
-                      <div key={dir.id} style={{ background: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.05)', borderRadius: 8, padding: '8px 10px', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                        <span style={{ fontSize: 13, color: '#cbd5e1', textTransform: 'capitalize' }}>{dir.text}</span>
-                        <span style={{ fontSize: 11, color: '#3b82f6', fontWeight: 600, flexShrink: 0 }}>{dir.dist}</span>
+                  <div style={{ marginTop: 6, display: 'flex', flexDirection: 'column', gap: 4, maxHeight: 80, overflowY: 'auto' }}>
+                    <div style={{ fontSize: 10, color: '#64748b', textTransform: 'uppercase', letterSpacing: '0.06em', fontWeight: 700 }}>Turn-by-turn</div>
+                    {directions.map((d, index) => (
+                      <div key={index} style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12, color: '#94a3b8', padding: '4px 0', borderBottom: '1px solid rgba(255,255,255,0.04)' }}>
+                        <span style={{ textTransform: 'capitalize' }}>{d.text}</span>
+                        <span style={{ color: '#3b82f6', fontWeight: 600, flexShrink: 0, marginLeft: 8 }}>{d.dist}</span>
                       </div>
                     ))}
                   </div>
                 )}
               </div>
-            ) : (
-              <>
-                <button
-                  onClick={handleSubmit}
-                  disabled={loading || !startLocation || destinations.length === 0}
-                  style={{
-                    background: loading ? 'rgba(59,130,246,0.4)' : 'linear-gradient(135deg, #2563eb, #3b82f6)',
-                    border: 'none', borderRadius: 12, color: 'white',
-                    fontSize: 14, fontWeight: 700, padding: '13px 0',
-                    cursor: (!startLocation || destinations.length === 0) ? 'not-allowed' : 'pointer',
-                    opacity: (!startLocation || destinations.length === 0) ? 0.4 : 1,
-                    width: '100%', letterSpacing: '0.02em',
-                    boxShadow: loading ? 'none' : '0 4px 16px rgba(37,99,235,0.4)',
-                  }}
-                >
-                  {loading ? 'Routing...' : '→ Get Route'}
+
+              <div style={{ width: 1, background: 'rgba(255,255,255,0.07)', flexShrink: 0 }} />
+
+              {/* Right: controls */}
+              <div style={{ width: 176, display: 'flex', flexDirection: 'column', gap: 8, justifyContent: 'flex-start', paddingTop: 4 }}>
+
+                {/* Live tracking */}
+                <button onClick={toggleTracking} style={{
+                  background: isTracking ? 'rgba(239,68,68,0.12)' : 'rgba(34,197,94,0.1)',
+                  border: `1px solid ${isTracking ? 'rgba(239,68,68,0.3)' : 'rgba(34,197,94,0.3)'}`,
+                  borderRadius: 10, color: isTracking ? '#ef4444' : '#22c55e',
+                  fontSize: 12, fontWeight: 600, padding: '8px 0', cursor: 'pointer', width: '100%',
+                  display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6,
+                }}>
+                  <div style={{ width: 8, height: 8, borderRadius: '50%', background: 'currentColor', animation: isTracking ? 'ping 1.5s infinite' : 'none' }} />
+                  {isTracking ? 'Stop Tracking' : '📍 Live Track'}
                 </button>
-                {error && (
-                  <p style={{ color: '#f87171', fontSize: 12, margin: 0, textAlign: 'center', lineHeight: 1.4 }}>{error}</p>
+
+                {/* Voice toggle */}
+                {/* <button onClick={() => setVoiceEnabled(v => !v)} style={{
+                  background: voiceEnabled ? 'rgba(168,85,247,0.15)' : 'rgba(255,255,255,0.05)',
+                  border: `1px solid ${voiceEnabled ? 'rgba(168,85,247,0.35)' : 'rgba(255,255,255,0.1)'}`,
+                  borderRadius: 10, color: voiceEnabled ? '#a855f7' : '#64748b',
+                  fontSize: 12, fontWeight: 600, padding: '8px 0', cursor: 'pointer', width: '100%',
+                }}>
+                  🧭 Voice {voiceEnabled ? 'On' : 'Off'}
+                </button>
+ */}
+                {result ? (
+                  <>
+                    <div style={{ display: 'flex', gap: 8 }}>
+                      <div style={{ flex: 1, background: 'rgba(59,130,246,0.1)', border: '1px solid rgba(59,130,246,0.2)', borderRadius: 10, padding: '8px 10px', textAlign: 'center' }}>
+                        <div style={{ fontSize: 10, color: '#64748b', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Dist</div>
+                        {(() => {
+                          const dist = distanceMeters != null
+                            ? formatDistanceMeters(distanceMeters)
+                            : formatDistance(totalDistance)
+                          return (
+                            <>
+                              <div style={{ fontSize: 16, fontWeight: 700, color: '#3b82f6' }}>{dist.value}</div>
+                              <div style={{ fontSize: 10, color: '#475569' }}>{dist.unit}</div>
+                            </>
+                          )
+                        })()}
+                      </div>
+                      <div style={{ flex: 1, background: 'rgba(34,197,94,0.1)', border: '1px solid rgba(34,197,94,0.2)', borderRadius: 10, padding: '8px 10px', textAlign: 'center' }}>
+                        <div style={{ fontSize: 10, color: '#64748b', textTransform: 'uppercase', letterSpacing: '0.05em' }}>ETA</div>
+                        <div style={{ fontSize: 16, fontWeight: 700, color: '#22c55e' }}>{etaMinutes != null ? etaFromMinutes(etaMinutes) : (totalDistance != null ? etaFromKm(totalDistance) : '—')}</div>
+                      </div>
+                    </div>
+
+                    {needsRecalc && (
+                      <button
+                        onClick={handleSubmit}
+                        disabled={loading}
+                        style={{
+                          background: loading ? 'rgba(59,130,246,0.4)' : 'linear-gradient(135deg, #2563eb, #3b82f6)',
+                          border: 'none', borderRadius: 10, color: 'white',
+                          fontSize: 12, fontWeight: 700, padding: '8px 0',
+                          cursor: loading ? 'not-allowed' : 'pointer',
+                          width: '100%', letterSpacing: '0.02em',
+                        }}
+                      >
+                        {loading ? 'Routing...' : 'Recalculate Route'}
+                      </button>
+                    )}
+
+                    {shareUrl && !needsRecalc && (
+                      <button onClick={() => { navigator.clipboard.writeText(shareUrl); alert('Link copied!') }} style={{
+                        background: 'rgba(251,191,36,0.1)', border: '1px solid rgba(251,191,36,0.25)',
+                        borderRadius: 10, color: '#fbbf24', fontSize: 12, fontWeight: 600,
+                        padding: '7px 0', cursor: 'pointer', width: '100%',
+                      }}>
+                        📍 Copy Share Link
+                      </button>
+                    )}
+
+                    {!needsRecalc && (
+                      <button onClick={() => { setStartLocation(null); setDestinations([]); resetRoute() }} style={{
+                        background: 'rgba(239,68,68,0.12)', border: '1px solid rgba(239,68,68,0.3)',
+                        borderRadius: 10, color: '#ef4444', fontSize: 12, fontWeight: 600,
+                        padding: '8px 0', cursor: 'pointer', width: '100%',
+                      }}>
+                        Clear route
+                      </button>
+                    )}
+                  </>
+                ) : (
+                  <>
+                    <button onClick={handleSubmit} disabled={loading || !startLocation || !destinations.length} style={{
+                      background: loading ? 'rgba(59,130,246,0.4)' : 'linear-gradient(135deg,#2563eb,#3b82f6)',
+                      border: 'none', borderRadius: 12, color: 'white', fontSize: 14, fontWeight: 700,
+                      padding: '12px 0', cursor: (!startLocation || !destinations.length) ? 'not-allowed' : 'pointer',
+                      opacity: (!startLocation || !destinations.length) ? 0.4 : 1,
+                      width: '100%', boxShadow: loading ? 'none' : '0 4px 16px rgba(37,99,235,0.4)',
+                    }}>
+                      {loading ? 'Routing...' : '→ Get Route'}
+                    </button>
+                    {error && <p style={{ color: '#f87171', fontSize: 12, margin: 0, textAlign: 'center' }}>{error}</p>}
+                  </>
                 )}
-              </>
-            )}
-          </div>
+              </div>
+            </>
+          )}
+
+          {/* ── FAVORITES TAB ── */}
+          {activeTab === 'favorites' && (
+            <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: 8 }}>
+              {!favorites.length ? (
+                <p style={{ color: '#475569', fontSize: 13, textAlign: 'center', marginTop: 20 }}>No saved places yet.<br />Tap ⭐ next to any location to save it.</p>
+              ) : favorites.map((fav, i) => (
+                <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '8px 10px', background: 'rgba(255,255,255,0.04)', borderRadius: 10, border: '1px solid rgba(255,255,255,0.07)' }}>
+                  <span style={{ fontSize: 18 }}>⭐</span>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ fontSize: 13, color: '#f1f5f9', fontWeight: 500, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{fav.street || fav.name || locLabel(fav)}</div>
+                    {(fav.area || fav.city) && <div style={{ fontSize: 11, color: '#64748b' }}>{[fav.area, fav.city].filter(Boolean).join(', ')}</div>}
+                  </div>
+                  <button onClick={() => handleSelectLocation(fav)} style={{ background: 'rgba(59,130,246,0.15)', border: '1px solid rgba(59,130,246,0.25)', borderRadius: 8, color: '#3b82f6', fontSize: 11, fontWeight: 600, padding: '4px 8px', cursor: 'pointer' }}>Go</button>
+                  <button onClick={() => removeFavorite(fav.lat, fav.lon)} style={{ background: 'none', border: 'none', color: '#475569', cursor: 'pointer', fontSize: 16 }}>×</button>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {/* ── HISTORY TAB ── */}
+          {activeTab === 'history' && (
+            <div style={{ flex:1, display:'flex', flexDirection:'column', gap:8 , overflowY:'auto', paddingRight:4}}>
+              {!history.length ? (
+                <p style={{ color:'#475569', fontSize:13, textAlign:'center', marginTop:20 }}>No routes calculated yet.</p>
+              ) : history.map((route)=>{
+                  const isActive = selectedRoute?.id === route.id
+                  const date = route.timestamp ? new Date(route.timestamp) : new Date()
+                  const dateStr = isNaN(date)?'-': date.toLocaleString([], { month:'short', day:'numeric' })
+                  const timeStr = isNaN(date)?'-': date.toLocaleTimeString([], { hour:'2-digit', minute:'2-digit' })
+                  const routeId = route._id ? String(route._id) : String(route.id)
+
+                  return(
+                    <div key={routeId} onClick={() => handleSelectRoute(route)} style={{
+                      padding:'10px 12px', borderRadius:12,
+                      background: isActive ? 'rgba(59,130,246,0.15)' : 'rgba(255,255,255,0.04)',
+                      border: isActive ? '1px solid rgba(59,130,246,0.25)' : '1px solid rgba(255,255,255,0.07)',
+                      transition:'all 0.15s ease'
+                    }}>
+                      {/* top row */}
+                      <div style={{ display:'flex', justifyContent:'space-between', marginBottom:6, alignItems:'center' }}>
+                        <span style={{fontSize:13, fontWeight:600, color: isActive? '#93c5fd' : '#f1f5f9'}}> Route #{routeId}</span>
+                        <span style={{ fontSize:11, color:'#475569' }}>{dateStr} {timeStr}</span>
+                      </div>    
+
+                      {/* locations */}
+                      <div style={{ fontSize:11, color:'#94a3b8', marginBottom:6, whiteSpace:'nowrap', overflow:'hidden', textOverflow:'ellipsis' }}>
+                        {route.start_location?.name || 'Start'}
+                        {' → '}
+                        {route.destinations?.length || 0 } {destinations.length > 1 ? 'destination' : 'destinations'}
+                      </div>
+
+                      <span style={{fontSize: 12,fontWeight: 600,
+                          color: isActive
+                            ? '#3b82f6'
+                            : '#cbd5e1',
+                        }}
+                      >
+                        {route.stats?.total_distance_km ?? '—'} km
+                      </span>
+
+                      <span
+                        style={{
+                          fontSize: 11,
+                          color: '#64748b',
+                        }}
+                      >
+                        {route.destinations?.length ?? 0} stops
+                      </span>
+                    </div>
+                  )
+                })
+
+              }
+            </div>
+          )}
+
+
+
         </div>
       </div>
     </div>

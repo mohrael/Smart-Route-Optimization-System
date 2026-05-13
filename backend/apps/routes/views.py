@@ -1,31 +1,150 @@
+from core.mongo import db
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
+from rest_framework.decorators import api_view, permission_classes
 from .serializers import RouteRequestSerializer, RouteResultSerializer
-from ..locations.models import Location
 from .models import RouteRequest, RouteRequestDestination, RouteResult
 import time
 from datetime import timedelta
-from drf_spectacular.utils import extend_schema, OpenApiExample
 from rest_framework.permissions import IsAuthenticated
 from ..algorithms.engine import _initialize_graph_and_algorithm
-# from .services.route_service import RouteService
 import osmnx as ox
-
 from ..algorithms.utils import optimize_route
+from .services.geocoding_service import get_coordinates
+from .services.history_service import save_route_history
+from ..algorithms.tsp_optimizer import optimize_route_tsp
+from ..algorithms.cache import connectedGraph, cache_info, cached_shortest_path
+import requests as http_requests
+from django.db import close_old_connections
+import threading
 
+def _fetch_osrm_route(start_coord, dest_coords):
+    """ Fetch road path + directions from OSRM """
+    try:
+        coords = [start_coord] + dest_coords
+        coord_str = ';'.join(f"{c['lon']},{c['lat']}" for c in coords)
+        url = f"https://router.project-osrm.org/route/v1/driving/{coord_str}?overview=full&geometries=geojson&steps=true"
+        res = http_requests.get(url,timeout=10)
+        data = res.json()
 
+        if data.get('code') != 'Ok' or not data.get('routes'):
+            return [],[]
+        
+        # road path as [[lat,lon],...]
+        road_path = [
+            [lat,lon]
+            for lon,lat in data['routes'][0]['geometry']['coordinates']
+        ]
+
+        steps = [step for leg in data['routes'][0]['legs'] for step in leg['steps']]
+        directions = []
+        for i, step in enumerate(steps):
+            maneuver = step.get('maneuver',{})
+            action = f"Turn {maneuver.get('modifier','')}" if maneuver.get('type') == 'turn' else maneuver.get('type','')
+            road = f"onto {step['name']}" if step.get('name') else 'ahead'
+            dist = f"{step['distance'] / 1000:.1f} km" if step['distance'] > 1000 else f"{int(step['distance'])} m"
+            text = f"{action} {road}".strip()
+            if text and 'arrive' not in text:
+                directions.append({'id': i, 'text': text, 'dist': dist})
+        return road_path,directions
+
+    except Exception as e:
+        print(f"OSRM fetch failed: {e}")
+        return [], []
+
+    
 def _snap_coord_to_node(G,lat,lon):
     return int(ox.distance.nearest_nodes(G,X=lon,Y=lat))
 
-def _get_access_nodes_for_coord(G,lat,lon,radius_meters=50):
-    north,south,east,west = ox.utils_geo.bbox_from_point((lat,lon),dist=radius_meters)
+def _get_access_nodes_for_coord(
+    G, lat: float, lon: float, radius_meters: float = 50, max_candidates: int = 8
+) -> list[int]:
+    north, south, east, west = ox.utils_geo.bbox_from_point((lat, lon), dist=radius_meters)
+    candidates = []
+    for node_id, data in G.nodes(data=True):
+        if "y" not in data or "x" not in data:
+            continue
+        if not (south <= data["y"] <= north and west <= data["x"] <= east):
+            continue
+        dy = data["y"] - lat
+        dx = data["x"] - lon
+        candidates.append((dy * dy + dx * dx, int(node_id)))
 
-    potential_nodes = []
-    for node_id in G.nodes:
-        if 'y' in G.nodes[node_id] and 'x' in G.nodes[node_id]:
-            if south <= G.nodes[node_id]['y'] <= north and west <= G.nodes[node_id]['x'] <= east:
-               potential_nodes.append(int(node_id))
+    if not candidates:
+        return []
+
+    candidates.sort(key=lambda item: item[0])
+    return [node_id for _, node_id in candidates[:max_candidates]]
+
+def _save_history_async(*, user_id, start_location, destinations, total_distance, road_path, directions=[]):
+    """Fire-and-forget: fetch OSRM + save route history on a daemon thread so the HTTP
+    response is returned immediately without waiting."""
+
+    def _worker():
+        close_old_connections()
+        try:
+            road_path_data, directions_data = _fetch_osrm_route(start_location, destinations)
+            save_route_history(
+                user_id=user_id,
+                start_location=start_location,
+                destinations=destinations,
+                total_distance=total_distance,
+                road_path=road_path_data,
+                directions=directions_data,
+            )
+        except Exception as exc:
+            print(f"[history_async] Failed to fetch OSRM/save: {exc}")
+
+    t = threading.Thread(target=_worker, daemon=True)
+    t.start()
+
+
+@api_view(['Get'])
+def search_location(request):
+    query = request.GET.get("q")
+
+    if not query:
+        return Response(
+            {"error":"Query is required"},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    
+    location = get_coordinates(query)
+
+    if not location:
+        return Response(
+            {"error":"Location not found"},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    return Response(location)
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def route_history(request):
+    user_id = str(request.user.id)
+
+    collection = db["route_history"]
+
+    data = list(
+        collection.find({"user_id":user_id}).sort("timestamp",-1).limit(30)
+    )
+
+    for d in data:
+        d["_id"] = str(d["_id"])
+        d["timestamp"] = str(d["timestamp"])
+
+    return Response(data)
+
+
+@api_view(["GET"])
+def cache_diagnostics(request):
+    """Dev/ops endpoint — returns path-cache hit rate and size."""
+    return Response(cache_info())
+
+
 
 
 class RouteRequestView(APIView):
@@ -33,12 +152,13 @@ class RouteRequestView(APIView):
     serializer_class = RouteRequestSerializer
 
     def post(self, request, *args, **kwargs):
+        # ── 1. Load graph 
         try:
             G, GRAPH, ALGORITHM = _initialize_graph_and_algorithm()
         except RuntimeError as e:
             return Response({"error": str(e)}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
 
-        # service = RouteService(G)
+        # 2. validate input 
         serializer = RouteRequestSerializer(data=request.data)
 
         if not serializer.is_valid():
@@ -46,49 +166,37 @@ class RouteRequestView(APIView):
         
         start_coord = serializer.validated_data['start_location']   # {lat, lon}
         dest_coords = serializer.validated_data['destinations']      # [{lat, lon}, ...]
+        selected_algorithm = serializer.validated_data['algorithm']
         
+        # 3. Snap coordinates -> OSM nodes (parallel)
         try:
-            start_nodes = _get_access_nodes_for_coord(G,start_coord['lat'],start_coord['lon'])
+            def snap_coord(lat, lon):
+                nodes = _get_access_nodes_for_coord(G, lat, lon)
+                return nodes if nodes else [_snap_coord_to_node(G, lat, lon)]
 
-            if not start_nodes:
-                start_nodes = [_snap_coord_to_node(G, start_coord['lat'], start_coord['lon'])]
-           
-            dest_nodes_list = [
-                _get_access_nodes_for_coord(G,d['lat'],d['lon'])
-                for d in dest_coords
-            ]
-            for i, dest_group in enumerate(dest_nodes_list):
-                 if not dest_group:
-                     dest_nodes_list[i] = [_snap_coord_to_node(G, dest_coords[i]['lat'], dest_coords[i]['lon'])]
-            
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+
+            all_coords = [(start_coord['lat'], start_coord['lon'])] + [(d['lat'], d['lon']) for d in dest_coords]
+            snap_results = {}
+
+            with ThreadPoolExecutor(max_workers=8) as executor:
+                futures = {executor.submit(snap_coord, lat, lon): i for i, (lat, lon) in enumerate(all_coords)}
+                for future in as_completed(futures):
+                    idx = futures[future]
+                    snap_results[idx] = future.result()
+
+            start_nodes = snap_results[0]
+            dest_nodes_list = [snap_results[i+1] for i in range(len(dest_coords))]
         except Exception as e:
             return Response({"error": f"Failed to snap coordinates to graph: {str(e)}"}, status=status.HTTP_400_BAD_REQUEST)
 
-
-        # start_id = serializer.validated_data['start_location']
-        # destinations_list = serializer.validated_data['destinations']
-
-        # requested_ids = set([start_id] + destinations_list)
-        # locations_qs = Location.objects.filter(id__in=requested_ids)
-        # all_locations = {loc.id: loc for loc in locations_qs}
-
-        # if start_id not in all_locations:
-        #     return Response({"error": "invalid start location"}, status=status.HTTP_400_BAD_REQUEST)
-
-        # start_location = all_locations[start_id]
-        # invalid_destinations = set(destinations_list) - set(all_locations.keys())
-        # if invalid_destinations:
-        #     return Response(
-        #         {"error": f"invalid destination location(s): {list(invalid_destinations)}"},
-        #         status=status.HTTP_400_BAD_REQUEST
-        #     )
-
+        
+        # 4. persist the request
         route_request = RouteRequest.objects.create(
             user=request.user,
             start_lat=start_coord['lat'],
             start_lon=start_coord['lon']
         )
-        # destination_objects = [all_locations[dest_id] for dest_id in destinations_list]
 
         RouteRequestDestination.objects.bulk_create([
             RouteRequestDestination(
@@ -99,25 +207,65 @@ class RouteRequestView(APIView):
             for d in dest_coords
         ])
 
-        # service = RouteService(G)
 
-
+        # 5. run algorithm
+        strongly_connected = connectedGraph(G)
         start_time = time.perf_counter()
-        path, cost = optimize_route(G,start_nodes, dest_nodes_list)
+        
+        if selected_algorithm == "GREEDY":
+            path, cost = optimize_route(
+                G,
+                start_nodes,
+                dest_nodes_list,
+                strongly_connected
+            )
+
+        elif selected_algorithm == "TSP":
+            path, cost = optimize_route_tsp(
+                G,
+                start_nodes,
+                dest_nodes_list,
+                strongly_connected
+            )
+
+        else:
+            return Response(
+                {"error": "Invalid algorithm"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+
         execution_time = timedelta(seconds=time.perf_counter() - start_time)
 
         if path is None or cost is None or cost == float("inf"):
+            route_request.delete()
             return Response(
                 {"error": "unreachable destination(s) - no valid path found"},
                 status=status.HTTP_400_BAD_REQUEST
             )
 
+        # 6. Persist result
         route_result = RouteResult.objects.create(
             route_request=route_request,
             total_cost=cost,
             path=path,
-            algorithm_used=RouteResult.AlgorithmChoices.DIJKSTRA,
+            algorithm_used=(
+                RouteResult.AlgorithmChoices.TSP_APPROX
+                if selected_algorithm == "TSP"
+                else RouteResult.AlgorithmChoices.DIJKSTRA
+            ),
             execution_time=execution_time,
+        )
+
+        road_path, directions = _fetch_osrm_route(start_coord, dest_coords)
+
+        _save_history_async(
+            user_id=request.user.id,
+            start_location=start_coord,
+            destinations=dest_coords,
+            total_distance=cost,
+            road_path=road_path,
+            directions=directions,
         )
 
         return Response(RouteResultSerializer(route_result).data, status=status.HTTP_201_CREATED)
@@ -157,12 +305,8 @@ class RouteResultView(APIView):
             return Response({"error": str(e)}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
 
         path_ids = route_result.path
-        # location_map = {
-        #     loc.id: loc
-        #     for loc in Location.objects.filter(id__in=path_ids)
-        # }
-
         path_with_coords = []
+
         for i in range(len(path_ids)):
             try:
                 node_id = int(path_ids[i])
@@ -175,20 +319,6 @@ class RouteResultView(APIView):
                     "longitude": G.nodes[node_id]['x']
                 })
 
-                # node_data = G.nodes[node_id]
-                
-                # lat = node_data.get("y")
-                # lon = node_data.get("x")
-                
-                # if lat is None or lon is None:
-                #     continue
-                
-                # path_with_coords.append({
-                #     # "id": node_id,
-                #     # "name": node_data.get("name") or f"OSM node {node_id}",
-                #     "latitude": lat,
-                #     "longitude": lon
-                # })
             if i < len(path_ids) - 1:
                 next_node_id = int(path_ids[i+1])
                 
@@ -206,14 +336,6 @@ class RouteResultView(APIView):
                                 "latitude": lat,
                                 "longitude": lon
                             })
-            # elif node_id in location_map:
-            #     loc = location_map[node_id]
-            #     path_with_coords.append({
-            #         "id": loc.id,
-            #         "name": loc.name,
-            #         "latitude": loc.latitude,
-            #         "longitude": loc.longitude
-            #     })
 
         # total_cost is in meters (OSM edge length), convert to km
         distance_km = round(route_result.total_cost / 1000, 2)

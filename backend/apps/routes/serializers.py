@@ -1,5 +1,5 @@
 from rest_framework import serializers
-from .models import RouteRequest, RouteResult
+from .models import RouteResult
 
 
 class LocationCoordSerializer(serializers.Serializer):
@@ -9,7 +9,7 @@ class LocationCoordSerializer(serializers.Serializer):
 class RouteRequestSerializer(serializers.Serializer):
     start_location = LocationCoordSerializer()
     destinations = serializers.ListField(child=LocationCoordSerializer(), min_length=1)
-
+    algorithm = serializers.ChoiceField(choices=["GREEDY","TSP"], default= "TSP")
 
 class RouteResultSerializer(serializers.ModelSerializer):
     total_distance_km = serializers.SerializerMethodField()

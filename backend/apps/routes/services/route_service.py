@@ -1,6 +1,6 @@
 from ...algorithms.snap_service import map_location_to_node
-from ...algorithms.graph_builder import build_graph
-from ...algorithms.dijkstra import Dijkstra
+# from ...algorithms.graph_builder import build_graph
+# from ...algorithms.dijkstra import Dijkstra
 from ...algorithms.utils import optimize_route
 
 
@@ -29,18 +29,5 @@ class RouteService:
         except Exception as e:
             print(f"Snapping error: {e}")
             return None, None
-
-        # from ...algorithms.graph_builder import build_graph
-        # graph = build_graph(self.G)
-
-        # algorithm = Dijkstra(graph)
-
-        # try:
-        #     path, cost = optimize_route(self.G, start_node, dest_nodes)
-        # except Exception as e:
-        #     print(f"Routing error: {e}")
-        #     return None, None
-
-
 
         return self.run_from_nodes(start_node,dest_nodes)

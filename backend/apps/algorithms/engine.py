@@ -2,6 +2,7 @@ import os
 import osmnx as ox
 from .graph_builder import load_and_plot_cairo
 from .graph_builder import build_graph
+from .cache import connectedGraph, _schedule_batch_flush
 
 G = None
 GRAPH = None  # adjacency dict for Dijkstra
@@ -29,7 +30,12 @@ def _initialize_graph_and_algorithm():
         except Exception as exc:
             print(f"Could not save graph cache: {exc}")
 
-    # G = load_and_plot_cairo()
     GRAPH = build_graph(G)
+
+    try:
+        connectedGraph(G)
+        _schedule_batch_flush()
+    except Exception as e:
+        print(f"Cache warm-up warning: {e}")
 
     return G, GRAPH, ALGORITHM
