@@ -5,7 +5,7 @@ from django.conf import settings
 
 
 class RouteRequest(models.Model):
-    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, null=True, blank=True)    
     start_lat = models.FloatField()
     start_lon = models.FloatField()
     timestamp = models.DateTimeField(auto_now_add=True)

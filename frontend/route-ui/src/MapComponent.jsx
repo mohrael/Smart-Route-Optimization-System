@@ -47,7 +47,7 @@ function FitBounds({ positions, trigger }) {
     if (!trigger || !positions.length) return
     if (positions.length > 1) map.fitBounds(L.latLngBounds(positions), { padding: [80, 80], maxZoom: 15 })
     else map.setView(positions[0], 14)
-  }, [trigger])
+  }, [trigger, positions])
   return null
 }
 
@@ -60,9 +60,20 @@ function RoutePolyline({ positions }) {
     if (refs.current.line)    { map.removeLayer(refs.current.line);    refs.current.line = null }
     if (positions.length < 2) return
 
-    refs.current.outline = L.polyline(positions, { color:'#ffffff', weight:12, opacity:0.35, lineJoin:'round', lineCap:'round' }).addTo(map)
+    // refs.current.outline = L.polyline(positions, { color:'#ffffff', weight:12, opacity:0.35, lineJoin:'round', lineCap:'round' }).addTo(map)
 
-    const line = L.polyline([], { color:'#757493', weight:6, opacity:1, lineJoin:'round', lineCap:'round' }).addTo(map)
+    // const line = L.polyline([], { color:'#757493', weight:6, opacity:1, lineJoin:'round', lineCap:'round' }).addTo(map)
+    // refs.current.line = line
+
+    refs.current.outline = L.polyline(positions, {
+      color: '#ebecef', weight: 8, opacity: 0.35, lineJoin: 'round', lineCap: 'round',
+    }).addTo(map)
+
+    // Main line — animate in
+    const line = L.polyline([], {
+      color: '#3b82f6', weight: 6, opacity: 1,
+      lineJoin: 'round', lineCap: 'round',
+    }).addTo(map)
     refs.current.line = line
 
     let i = 0
@@ -172,6 +183,13 @@ export default function MapComponent({
     [roadPath, pathLocation]
   )
 
+  const boundPositions = useMemo(() => {
+    const positions = [...displayPath]
+    if (startLocation) positions.push([startLocation.lat, startLocation.lon])
+    destinations.forEach(d => positions.push([d.lat, d.lon]))
+    return positions
+  }, [displayPath, startLocation, destinations])
+
   const getIcon = useCallback((loc) => {
     if (startLocation && startLocation.id && loc.id && startLocation.id === loc.id) return startIcon
     if (startLocation && !startLocation.id && Math.abs(startLocation.lat - loc.latitude) < 0.0001 && Math.abs(startLocation.lon - loc.longitude) < 0.0001) return startIcon
@@ -204,7 +222,7 @@ export default function MapComponent({
         <MapReady onMapReady={onMapReady} />
         <MapClickHandler onSelectLocation={onSelectLocation} />
         <FlyToUser userLocation={userLocation} />
-        <FitBounds positions={displayPath} trigger={hasPath} />
+        <FitBounds positions={boundPositions} trigger={hasPath} />
 
         {smoothPath.length > 1 && <TrackingTrail path={smoothPath} />}
 

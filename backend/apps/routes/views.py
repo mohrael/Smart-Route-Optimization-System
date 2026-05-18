@@ -18,6 +18,8 @@ from ..algorithms.cache import connectedGraph, cache_info, cached_shortest_path
 import requests as http_requests
 from django.db import close_old_connections
 import threading
+from .services.favorites_service import save_favorite
+from bson import ObjectId
 
 def _fetch_osrm_route(start_coord, dest_coords):
     """ Fetch road path + directions from OSRM """
@@ -124,19 +126,21 @@ def search_location(request):
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
 def route_history(request):
-    user_id = str(request.user.id)
-
-    collection = db["route_history"]
-
-    data = list(
-        collection.find({"user_id":user_id}).sort("timestamp",-1).limit(30)
-    )
-
-    for d in data:
-        d["_id"] = str(d["_id"])
-        d["timestamp"] = str(d["timestamp"])
-
-    return Response(data)
+    try:
+        user_id = str(request.user.id)
+        collection = db["route_history"]
+        data = list(
+            collection.find({"user_id":user_id}).sort("timestamp",-1).limit(30)
+        )
+        for d in data:
+            d["_id"] = str(d["_id"])
+            d["timestamp"] = str(d["timestamp"])
+        return Response(data)
+    except Exception as e:
+        return Response(
+            {"error": f"Failed to load history: {str(e)}"},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR
+        )
 
 
 @api_view(["GET"])
@@ -145,10 +149,72 @@ def cache_diagnostics(request):
     return Response(cache_info())
 
 
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def add_favorites(request):
+    location = request.data.get("location")
+
+    if not location:
+        return Response(
+            {"error":"Location required"},
+            status=status.HTTP_400_BAD_REQUEST
+        )
+
+    try:
+        save_favorite(
+            user_id=request.user.id,
+            location=location
+        )
+    except Exception as e:
+        return Response(
+            {"error": str(e)},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR
+        )
+
+    return Response({"message":"Favorite saved"})
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def get_favorites(request):
+    collection = db["favorites"]
+
+    favorites = list(
+        collection.find({
+            "user_id":str(request.user.id)
+        })
+    )
+
+    for fav in favorites:
+        fav["_id"] = str(fav["_id"])
+
+    return Response(favorites)
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def remove_favorite(request):
+    fav_id = request.data.get("location_id")
+
+    if not fav_id:
+        return Response(
+            {"error":"location_id is required"},
+            status=status.HTTP_400_BAD_REQUEST
+        )
+    
+    collection = db["favorites"]
+    result = collection.delete_one({
+        "_id": ObjectId(fav_id)
+    })
+    if result.deleted_count == 0:
+        return Response(
+            {"error":"Favorite not found"},
+            status=status.HTTP_404_NOT_FOUND
+        )
+    return Response({"message":"Favorite removed"})
 
 
 class RouteRequestView(APIView):
-    permission_classes = [IsAuthenticated]
+    # permission_classes = [IsAuthenticated]
     serializer_class = RouteRequestSerializer
 
     def post(self, request, *args, **kwargs):
@@ -192,8 +258,10 @@ class RouteRequestView(APIView):
 
         
         # 4. persist the request
+        current_user = request.user if request.user.is_authenticated else None
+        
         route_request = RouteRequest.objects.create(
-            user=request.user,
+            user=current_user,
             start_lat=start_coord['lat'],
             start_lon=start_coord['lon']
         )
@@ -271,6 +339,11 @@ class RouteRequestView(APIView):
         return Response(RouteResultSerializer(route_result).data, status=status.HTTP_201_CREATED)
 
     def get(self, request, *args, **kwargs):
+        if not request.user.is_authenticated:
+            return Response(
+                [],
+                status=status.HTTP_401_UNAUTHORIZED
+            )
         requests = RouteRequest.objects.filter(user=self.request.user)
         result = []
         for req in requests:

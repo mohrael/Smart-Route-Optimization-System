@@ -1,7 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import MapComponent from './MapComponent'
-
-const TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ0b2tlbl90eXBlIjoiYWNjZXNzIiwiZXhwIjoxNzc4Nzc3ODY4LCJpYXQiOjE3Nzg2OTE0NjgsImp0aSI6ImM1ZTA1M2ZlYjg2MzQxOGQ5Y2U0ZGQ3MGM1YzYwZTA2IiwidXNlcl9pZCI6IjEifQ.Lg14oxQ2svRL-aUqqnshCMcNTd4D6P2SeR0xUJtHqDQ"
+import './App.css'
 
 const locLabel = (loc) => {
   if (!loc) return ''
@@ -25,7 +24,7 @@ export default function App() {
   const [roadPath, setRoadPath]           = useState([])
   const [search, setSearch]               = useState('')
   const [searchLoading, setSearchLoading] = useState(false)
-  const [panelOpen, setPanelOpen]         = useState(true)
+  const [panelOpen, setPanelOpen]         = useState(false)
   const [userLocation, setUserLocation]   = useState(null)
   const [directions, setDirections]       = useState([])
   const [isTracking, setIsTracking]       = useState(false)
@@ -37,42 +36,221 @@ export default function App() {
   const [algorithm, setAlgorithm] = useState('TSP')
   const [needsRecalc, setNeedsRecalc] = useState(false)
 
-  // --- NEW STATES FOR THE UI UPGRADE ---
   const [activeTab, setActiveTab] = useState('route')
   const [favorites, setFavorites] = useState([])
   const [voiceEnabled, setVoiceEnabled] = useState(false)
-  const [shareUrl, setShareUrl] = useState('') // Set this when a route is successfully fetched
+  const [shareUrl, setShareUrl] = useState('')
   const TABS = ['route', 'favorites', 'history']
 
-  // --- NEW HELPERS ---
-  const saveFavorite = (loc) => {
+  // --- Authentication states ---
+  const [authToken, setAuthToken] = useState(() => localStorage.getItem('accessToken') || '')
+  const isAuthenticated = Boolean(authToken)
+  const [showAuthModal, setShowAuthModal] = useState(false) // <-- NEW: Controls the login popup
+  const [showLogoutModal, setShowLogoutModal] = useState(false)
+  const [authMode, setAuthMode] = useState('login')
+  const [authUsername, setAuthUsername] = useState('')
+  const [authEmail, setAuthEmail] = useState('')
+  const [authPassword, setAuthPassword] = useState('')
+  const [authConfirmPassword, setAuthConfirmPassword] = useState('')
+  const [authMessage, setAuthMessage] = useState('')
+  const [authBusy, setAuthBusy] = useState(false)
+
+  const authHeaders = () => {
+    return authToken ? { Authorization: `Bearer ${authToken}` } : {}
+  }
+  
+  const persistAuth = (accessToken, refreshToken) => {
+    if (accessToken) {
+      localStorage.setItem('accessToken', accessToken)
+      setAuthToken(accessToken)
+    } else {
+      localStorage.removeItem('accessToken')
+      setAuthToken('')
+    }
+    if (refreshToken) {
+      localStorage.setItem('refreshToken', refreshToken)
+    } else {
+      localStorage.removeItem('refreshToken')
+    }
+  }
+
+  // <-- NEW: Helper to check auth and show modal if needed
+  const requireAuth = () => {
+    if (!isAuthenticated) {
+      setShowAuthModal(true)
+      return false
+    }
+    return true
+  }
+
+  const handleLogin = async () => {
+    setAuthBusy(true)
+    setAuthMessage('')
+    try {
+      const res = await fetch('http://127.0.0.1:8000/api/token/', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          username: authUsername,
+          password: authPassword,
+        }),
+      })
+      const data = await res.json()
+      if (res.ok) {
+        persistAuth(data.access, data.refresh)
+        setAuthMessage('Logged in successfully.')
+        setShowAuthModal(false) // Close modal on success!
+      } else {
+        setAuthMessage(data.detail || 'Invalid credentials.')
+      }
+    } catch (error) {
+      setAuthMessage('Unable to reach the auth server.')
+    } finally {
+      setAuthBusy(false)
+    }
+  }
+
+  const handleSignup = async () => {
+    setAuthBusy(true)
+    setAuthMessage('')
+    try{
+      const res = await fetch('http://127.0.0.1:8000/user/register/', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          username: authUsername,
+          email: authEmail,
+          password: authPassword,
+          confirm_password: authConfirmPassword,
+        }),
+      })
+
+      const data = await res.json()
+      if (res.ok) {
+        setAuthMessage(data?.message || 'Account created successfully. You can now log in.')
+        setAuthMode('login')
+        setAuthPassword('')
+        setAuthConfirmPassword('')
+      } else {
+        const firstError = Object.values(data || {}).flat().find(Boolean)
+        setAuthMessage(firstError || 'Signup failed. Please check your input.')
+      }
+    } catch (error) {
+      setAuthMessage('Unable to reach the auth server.')
+    } finally {
+      setAuthBusy(false)
+    }
+  }
+
+  const handleLogout = () => { 
+    persistAuth('', '')
+    setAuthMessage('')
+    setFavorites([])
+    setHistory([])
+    setActiveTab('route')
+    // setResult(null)
+    // setRoadPath([])
+    // setDirections([])
+    // setStartLocation(null)
+    // setDestinations([])
+  }
+
+  const confirmLogout = () => {
+    handleLogout()
+    setShowLogoutModal(false)
+  }
+
+  // --- Favorites ---
+  const loadFavorites = async () => {
+    try {
+      const res = await fetch('http://127.0.0.1:8000/routes/favorites/', {
+        headers: authHeaders()
+      })
+      const data = await res.json()
+      if (!res.ok) return
+      setFavorites( (data || []).map(fav => ({
+        id: fav._id,
+        lat: fav.location.lat,
+        lon: fav.location.lon,
+        name: fav.location.name,
+        area: fav.location.area,
+        city: fav.location.city
+      })))
+    } catch (error) { console.error("Error loading favorites:", error) }
+  }
+
+  const saveFavorite = async (loc) => {
+    if (!requireAuth()) return; // <-- GUARDED
+
+    try {
+      const alreadyExists = favorites.some(f =>
+        Math.abs(f.lat - loc.lat) < 0.0001 && Math.abs(f.lon - loc.lon) < 0.0001
+      )
+      if (alreadyExists) return
+
+      const cleanedLocation = {
+        name: loc.street || loc.name,
+        lat: loc.lat,
+        lon: loc.lon,
+        area: loc.area || "",
+        city: loc.city || "",
+      }
+      
+      const res = await fetch('http://127.0.0.1:8000/routes/favorites/add/', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...authHeaders() },
+        body: JSON.stringify({ location: cleanedLocation })
+      })
+      if (res.ok) await loadFavorites()
+    } catch (error) { console.error("Error saving favorite:", error) }
+  }
+
+  const findFavoriteByLocation = (loc) => {
+    if (!loc) return null
+    return favorites.find(f => Math.abs(f.lat - loc.lat) < 0.0001 && Math.abs(f.lon - loc.lon) < 0.0001) || null
+  }
+
+  const removeFavorite = async (loc) => {
+    if (!requireAuth()) return; // <-- GUARDED
+    try {
+      const favorite = findFavoriteByLocation(loc)
+      const favoriteId = favorite?.id || loc?.id
+      if (!favoriteId) return
+
+      const res = await fetch('http://127.0.0.1:8000/routes/favorites/remove/',{
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...authHeaders() },
+        body: JSON.stringify({ location_id: favoriteId })
+      })
+      if (res.ok) setFavorites(prev => prev.filter(f => f.id !== favoriteId))
+    } catch (error) { console.error("Error removing favorite:", error) }
+  }
+
+  const isFavorited = (loc) => {
+    if (!loc) return false
+    return favorites.some(f => Math.abs(f.lat - loc.lat) < 0.0001 && Math.abs(f.lon - loc.lon) < 0.0001)
+  }
+
+  const toggleFavorite = async (loc) => {
+    if (!requireAuth()) return; // <-- GUARDED
     if (!loc) return
-    setFavorites(prev => {
-      const exists = prev.some(f => Math.abs(f.lat - loc.lat) < 0.0001 && Math.abs(f.lon - loc.lon) < 0.0001)
-      if (!exists) return [...prev, loc]
-      return prev
-    })
-  }
-  const removeFavorite = (lat, lon) => {
-    setFavorites(prev => prev.filter(f => Math.abs(f.lat - lat) >= 0.0001 || Math.abs(f.lon - lon) >= 0.0001))
+    if (isFavorited(loc)) await removeFavorite(loc)
+    else await saveFavorite(loc)
   }
 
-  // // ── favorites ────────────────────────────────────────────────────────────────
-  // const saveFavorite = (loc) => {
-  //   const fav = { ...loc, savedAt: new Date().toLocaleDateString() }
-  //   const updated = [fav, ...favorites.filter(f => !(f.lat === loc.lat && f.lon === loc.lon))].slice(0, 50)
-  //   setFavorites(updated)
-  //   localStorage.setItem('favorites', JSON.stringify(updated))
-  // }
-
-  // const removeFavorite = (lat, lon) => {
-  //   const updated = favorites.filter(f => !(f.lat === lat && f.lon === lon))
-  //   setFavorites(updated)
-  //   localStorage.setItem('favorites', JSON.stringify(updated))
-  // }
+  useEffect(() => {
+    loadLocations()
+    if(!authToken) {
+      setFavorites([])
+      setHistory([])
+      return
+    }
+    loadFavorites()
+    loadHistory()
+  }, [authToken])
 
   const etaFromKm = (km) => {
-    const mins = Math.round(Number(km) * 2.5); // Rough city estimate: 2.5 mins per km
+    const mins = Math.round(Number(km) * 2.5); 
     if (mins < 60) return `${mins} min`
     const hrs = Math.floor(mins / 60)
     return `${hrs}h ${mins % 60}m`
@@ -107,28 +285,7 @@ export default function App() {
     return R * 2 * Math.atan2(Math.sqrt(x), Math.sqrt(1-x))
   }
 
-  // const speak = (text) => {
-  //   if (!window.speechSynthesis) return
-  //   window.speechSynthesis.cancel()
-  //   const u = new SpeechSynthesisUtterance(text)
-  //   u.lang = 'en-US'; u.rate = 0.95
-  //   window.speechSynthesis.speak(u)
-  // }
-  // async function reverseGeocode(lat, lon) {
-  //   try {
-  //     const res = await fetch(`https://nominatim.openstreetmap.org/reverse?format=json&lat=${lat}&lon=${lon}&zoom=18&addressdetails=1`)
-  //     const d = await res.json()
-  //     const a = d.address || {}
-  //     return {
-  //       street: a.road || a.pedestrian || a.path || '',
-  //       area:   a.neighbourhood || a.suburb || a.quarter || '',
-  //       city:   a.city || a.town || a.village || a.county || '',
-  //       display: [a.road, a.neighbourhood || a.suburb, a.city || a.town].filter(Boolean).join(', ') || d.display_name?.split(',')[0] || 'Unknown location'
-  //     }
-  //   } catch { return { street: '', area: '', city: '', display: 'Unknown location' } }
-  // }
-
-    async function reverseGeocode(lat, lon) {
+  async function reverseGeocode(lat, lon) {
     try {
       const res = await fetch(`https://nominatim.openstreetmap.org/reverse?format=json&lat=${lat}&lon=${lon}&zoom=18&addressdetails=1`)
       const d = await res.json()
@@ -144,10 +301,7 @@ export default function App() {
     }
   }
 
-
-  
   const loadRoute = async (route) => {
-    // Restore start/dest as loc objects
     const start = {
       lat: route.start_location.lat,
       lon: route.start_location.lon,
@@ -163,7 +317,6 @@ export default function App() {
     setDestinations(dests)
     setTotalDistance(route.stats?.total_distance_km ?? null)
 
-    // Use saved road path if available, otherwise re-fetch from OSRM
     if (route.road_path?.length > 0) {
       setRoadPath(route.road_path)
     } else {
@@ -171,15 +324,14 @@ export default function App() {
       setRoadPath(rp)
     }
 
-    // Use saved directions if available
     if (route.directions?.length > 0) {
       setDirections(route.directions)
     }
 
-    // Set a fake result so the result panel shows
     setResult({ id: null, total_distance_km: route.stats?.total_distance_km })
     setHistoryOpen(false)
   }
+
   async function loadLocations() {
     try {
       const res = await fetch('http://127.0.0.1:8000/location/get_locations/', {
@@ -193,10 +345,9 @@ export default function App() {
   async function loadHistory() {
     try {
       const res = await fetch("http://127.0.0.1:8000/routes/history/", {
-        headers: { Authorization: `Bearer ${TOKEN}` }
+        headers: authHeaders(),
       })
       const data = await res.json()
-      console.log("History response:", data)
       setHistory(data)
     } catch {
       console.error("Failed to load history")
@@ -206,7 +357,7 @@ export default function App() {
   async function fetchPathLocations(id) {
     try {
       const res = await fetch(`http://127.0.0.1:8000/routes/location_path/${id}/`, {
-        headers: { 'Content-Type': 'application/json' },
+        headers: authHeaders(),
       })
       const data = await res.json()
       if (res.ok) {
@@ -242,11 +393,6 @@ export default function App() {
       return data.routes[0].geometry.coordinates.map(([lon, lat]) => [lat, lon])
     } catch { return [] }
   }
-
-  useEffect(() => {
-    loadLocations()
-    loadHistory()
-  }, [])
 
   const resetRoute = () => {
     setPathLocation([])
@@ -305,52 +451,30 @@ export default function App() {
   }
 
   const handleSelectLocation = useCallback(async (loc) => {
-
-    // -----------------------------------
-    // Step 1: enrich raw coordinates
-    // -----------------------------------
-
     let enriched = loc
-
-    const hasName =
-      loc.name ||
-      loc.street
+    const hasName = loc.name || loc.street
 
     if (!hasName && loc.lat && loc.lon) {
       try {
         const geo = await reverseGeocode(loc.lat, loc.lon)
-
         enriched = {
           ...loc,
           ...geo,
           name: geo.display,
         }
-
-      } catch (err) {
-        console.error("Reverse geocoding failed:", err)
-      }
+      } catch (err) { console.error("Reverse geocoding failed:", err) }
     }
-
-    // -----------------------------------
-    // Step 2: first selected point = start
-    // -----------------------------------
 
     if (!startLocation) {
       setStartLocation(enriched)
+      setPanelOpen(true)
       resetRoute()
       return
     }
 
-    // -----------------------------------
-    // Step 3: clicking same start removes route
-    // -----------------------------------
-
     const isSameAsStart = startLocation.id
       ? startLocation.id === enriched.id
-      : (
-          startLocation.lat === enriched.lat &&
-          startLocation.lon === enriched.lon
-        )
+      : (startLocation.lat === enriched.lat && startLocation.lon === enriched.lon)
 
     if (isSameAsStart) {
       setStartLocation(null)
@@ -359,37 +483,20 @@ export default function App() {
       return
     }
 
-    // -----------------------------------
-    // Step 4: toggle destination
-    // -----------------------------------
-
     setDestinations(prev => {
-
       const exists = prev.some(d =>
-        d.id
-          ? d.id === enriched.id
-          : (
-              d.lat === enriched.lat &&
-              d.lon === enriched.lon
-            )
+        d.id ? d.id === enriched.id : (d.lat === enriched.lat && d.lon === enriched.lon)
       )
 
       if (exists) {
         return prev.filter(d =>
-          d.id
-            ? d.id !== enriched.id
-            : !(
-                d.lat === enriched.lat &&
-                d.lon === enriched.lon
-              )
+          d.id ? d.id !== enriched.id : !(d.lat === enriched.lat && d.lon === enriched.lon)
         )
       }
-
+      setPanelOpen(true)
       return [...prev, enriched]
     })
-
     resetRoute()
-
   }, [startLocation])
 
   const handleSearch = async () => {
@@ -425,7 +532,7 @@ export default function App() {
     try {
       const res = await fetch('http://127.0.0.1:8000/routes/optimize-route/', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${TOKEN}` },
+        headers: { 'Content-Type': 'application/json', ...authHeaders() },
         body: JSON.stringify({
           start_location: { lat: startLocation.lat, lon: startLocation.lon },
           destinations: validDests.map(d => ({ lat: d.lat, lon: d.lon })),
@@ -435,6 +542,12 @@ export default function App() {
       const data = await res.json()
       if (!res.ok) { setError(data?.detail || data?.error || 'Request failed.'); return }
       setResult(data)
+      // Refresh history (backend saves history asynchronously). Try immediate + delayed retries.
+      try {
+        loadHistory()
+        setTimeout(() => loadHistory(), 1500)
+        setTimeout(() => loadHistory(), 3500)
+      } catch (e) { /* ignore */ }
       setNeedsRecalc(false)
       if (data.id) await fetchPathLocations(data.id)
       setRoadPath(await fetchRoadPath(startLocation, validDests))
@@ -442,8 +555,22 @@ export default function App() {
     finally { setLoading(false) }
   }
 
+
   return (
     <div style={{ position: 'relative', width: '100vw', height: '100vh', overflow: 'hidden', fontFamily: "'DM Sans', system-ui, sans-serif", background: '#0f172a' }}>
+
+      {/* TOP RIGHT LOGIN/LOGOUT BUTTON */}
+      <div className="auth-button">
+        {isAuthenticated ? (
+          <button onClick={() => setShowLogoutModal(true)} style={{ background: 'rgba(239,68,68,0.9)', border: 'none', padding: '8px 16px', borderRadius: 12, color: 'white', fontWeight: 600, cursor: 'pointer', boxShadow: '0 4px 12px rgba(0,0,0,0.2)' }}>
+            Log out
+          </button>
+        ) : (
+          <button onClick={() => setShowAuthModal(true)} style={{ background: 'rgba(59,130,246,0.9)', border: 'none', padding: '8px 16px', borderRadius: 12, color: 'white', fontWeight: 600, cursor: 'pointer', boxShadow: '0 4px 12px rgba(0,0,0,0.2)' }}>
+            Log in
+          </button>
+        )}
+      </div>
 
       {/* Full-screen map */}
       <div style={{ position: 'absolute', inset: 0 }}>
@@ -460,15 +587,7 @@ export default function App() {
       </div>
 
       {/* Top search bar */}
-      <div style={{
-        position: 'absolute', top: 16, left: '50%', transform: 'translateX(-50%)',
-        width: 'min(560px, calc(100vw - 32px))',
-        background: 'rgba(15,23,42,0.93)', backdropFilter: 'blur(20px)',
-        borderRadius: 14, border: '1px solid rgba(255,255,255,0.1)',
-        boxShadow: '0 8px 32px rgba(0,0,0,0.4)',
-        display: 'flex', alignItems: 'center', gap: 8, padding: '10px 14px',
-        zIndex: 1000,
-      }}>
+      <div className="top-search">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#64748b" strokeWidth="2">
           <circle cx="11" cy="11" r="8" /><path d="m21 21-4.35-4.35" />
         </svg>
@@ -479,12 +598,11 @@ export default function App() {
           onChange={e => setSearch(e.target.value)}
           onKeyDown={e => e.key === 'Enter' && handleSearch()}
           style={{
-            flex: 1, background: 'transparent', border: 'none', outline: 'none',
+            flex: 1, minWidth: 0, background: 'transparent', border: 'none', outline: 'none',
             color: '#f1f5f9', fontSize: 14, caretColor: '#3b82f6',
           }}
         />
         
-        {/* choose algorithm if Greedy or TSP */}
         <select
           value={algorithm}
           onChange={e => {
@@ -495,7 +613,7 @@ export default function App() {
           style={{
             marginLeft: 8, background: 'rgba(255,255,255,0.07)', border: '1px solid rgba(255,255,255,0.12)',
             color: '#f1f5f9', fontSize: 12, borderRadius: 8, padding: '5px 10px',
-            cursor: 'pointer',
+            cursor: 'pointer', minWidth: 0,
           }}
         >
           <option value="TSP" style={{ color: '#0f172a' }}>TSP (Exact)</option>
@@ -509,7 +627,7 @@ export default function App() {
             style={{
               background: '#3b82f6', border: 'none', borderRadius: 8,
               color: 'white', fontSize: 12, fontWeight: 600,
-              padding: '5px 12px', cursor: 'pointer', whiteSpace: 'nowrap',
+              padding: '5px 12px', cursor: 'pointer', whiteSpace: 'nowrap', minWidth: 0,
             }}
           >
             {searchLoading ? '...' : 'Go'}
@@ -542,52 +660,19 @@ export default function App() {
       {/* Map zoom buttons */}
       <div
         style={{
-          position: 'absolute',
-          right: 20,
-          bottom: panelOpen ? 372 : 90,
-          display: 'flex',
-          flexDirection: 'column',
-          gap: 8,
-          zIndex: 1001,
+          position: 'absolute', right: 20, bottom: panelOpen ? 372 : 90,
+          display: 'flex', flexDirection: 'column', gap: 8, zIndex: 1001,
         }}
       >
         <button
-          onClick={() => mapRef.current?.zoomIn()}
-          disabled={!mapRef.current}
-          style={{
-            width: 40,
-            height: 40,
-            borderRadius: 12,
-            background: 'rgba(15,23,42,0.92)',
-            backdropFilter: 'blur(12px)',
-            border: '1px solid rgba(255,255,255,0.12)',
-            color: '#e2e8f0',
-            fontSize: 18,
-            cursor: mapRef.current ? 'pointer' : 'not-allowed',
-            opacity: mapRef.current ? 1 : 0.5,
-            boxShadow: '0 4px 16px rgba(0,0,0,0.3)',
-          }}
-          aria-label="Zoom in"
+          onClick={() => mapRef.current?.zoomIn()} disabled={!mapRef.current}
+          style={{ width: 40, height: 40, borderRadius: 12, background: 'rgba(15,23,42,0.92)', backdropFilter: 'blur(12px)', border: '1px solid rgba(255,255,255,0.12)', color: '#e2e8f0', fontSize: 18, cursor: mapRef.current ? 'pointer' : 'not-allowed', opacity: mapRef.current ? 1 : 0.5, boxShadow: '0 4px 16px rgba(0,0,0,0.3)' }}
         >
           +
         </button>
         <button
-          onClick={() => mapRef.current?.zoomOut()}
-          disabled={!mapRef.current}
-          style={{
-            width: 40,
-            height: 40,
-            borderRadius: 12,
-            background: 'rgba(15,23,42,0.92)',
-            backdropFilter: 'blur(12px)',
-            border: '1px solid rgba(255,255,255,0.12)',
-            color: '#e2e8f0',
-            fontSize: 18,
-            cursor: mapRef.current ? 'pointer' : 'not-allowed',
-            opacity: mapRef.current ? 1 : 0.5,
-            boxShadow: '0 4px 16px rgba(0,0,0,0.3)',
-          }}
-          aria-label="Zoom out"
+          onClick={() => mapRef.current?.zoomOut()} disabled={!mapRef.current}
+          style={{ width: 40, height: 40, borderRadius: 12, background: 'rgba(15,23,42,0.92)', backdropFilter: 'blur(12px)', border: '1px solid rgba(255,255,255,0.12)', color: '#e2e8f0', fontSize: 18, cursor: mapRef.current ? 'pointer' : 'not-allowed', opacity: mapRef.current ? 1 : 0.5, boxShadow: '0 4px 16px rgba(0,0,0,0.3)' }}
         >
           −
         </button>
@@ -597,12 +682,8 @@ export default function App() {
       <button
         onClick={() => setPanelOpen(p => !p)}
         style={{
-          position: 'absolute', bottom: panelOpen ? 308 : 20, right: 20,
-          width: 44, height: 44, borderRadius: '50%',
-          background: 'rgba(15,23,42,0.92)', backdropFilter: 'blur(12px)',
-          border: '1px solid rgba(255,255,255,0.12)', color: '#94a3b8', fontSize: 18, cursor: 'pointer',
-          display: 'flex', alignItems: 'center', justifyContent: 'center',
-          boxShadow: '0 4px 16px rgba(0,0,0,0.3)', transition: 'bottom 0.35s cubic-bezier(0.4,0,0.2,1)', zIndex: 1001,
+          position: 'absolute', bottom: panelOpen ? 308 : 20, right: 20, width: 44, height: 44, borderRadius: '50%',
+          background: 'rgba(15,23,42,0.92)', backdropFilter: 'blur(12px)', border: '1px solid rgba(255,255,255,0.12)', color: '#94a3b8', fontSize: 18, cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', boxShadow: '0 4px 16px rgba(0,0,0,0.3)', transition: 'bottom 0.35s cubic-bezier(0.4,0,0.2,1)', zIndex: 1001,
         }}
       >
         {panelOpen ? '↓' : '↑'}
@@ -617,20 +698,25 @@ export default function App() {
         borderTop: '1px solid rgba(255,255,255,0.08)', borderRadius: '20px 20px 0 0',
         zIndex: 1000, display: 'flex', flexDirection: 'column',
       }}>
-        {/* Drag handle */}
-        <div style={{ display: 'flex', justifyContent: 'center', padding: '12px 0 4px' }}>
-          <div style={{ width: 36, height: 4, borderRadius: 2, background: 'rgba(255,255,255,0.2)' }} />
-        </div>
+        {/* Toggle button */}
+        <button onClick={() => setPanelOpen(!panelOpen)} style={{ display: 'flex', justifyContent: 'center', padding: '12px 0 4px', background: 'none', border: 'none', cursor: 'pointer' }}>
+          <div style={{ width: 36, height: 4, borderRadius: 2, background: 'rgba(255,255,255,0.2)', transition: 'background 0.2s' }} />
+        </button>
 
         {/* Tabs */}
         <div style={{ display: 'flex', gap: 4, padding: '0 20px 10px' }}>
           {TABS.map(tab => (
-            <button key={tab} onClick={() => setActiveTab(tab)} style={{
-              flex: 1, padding: '6px 0', fontSize: 12, fontWeight: 600, borderRadius: 8, border: 'none', cursor: 'pointer',
-              background: activeTab === tab ? 'rgba(59,130,246,0.2)' : 'rgba(255,255,255,0.05)',
-              color: activeTab === tab ? '#3b82f6' : '#64748b',
-              textTransform: 'capitalize',
-            }}>
+            <button key={tab} onClick={() => {
+                // <-- NEW: Intercept clicks to protected tabs
+                if ((tab === 'favorites' || tab === 'history') && !requireAuth()) return;
+                setActiveTab(tab)
+              }} 
+              style={{
+                flex: 1, padding: '6px 0', fontSize: 12, fontWeight: 600, borderRadius: 8, border: 'none', cursor: 'pointer',
+                background: activeTab === tab ? 'rgba(59,130,246,0.2)' : 'rgba(255,255,255,0.05)',
+                color: activeTab === tab ? '#3b82f6' : '#64748b',
+                textTransform: 'capitalize',
+              }}>
               {tab === 'route' ? '🗺 Route' : tab === 'favorites' ? '⭐ Saved' : '🕒 History'}
             </button>
           ))}
@@ -655,7 +741,7 @@ export default function App() {
                         <div style={{ fontSize: 11, color: '#64748b' }}>{[startLocation.area, startLocation.city].filter(Boolean).join(', ')}</div>
                       )}
                     </div>
-                    <button onClick={() => saveFavorite(startLocation)} title="Save" style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: 14 }}>⭐</button>
+                    <button onClick={() => toggleFavorite(startLocation)} title={isFavorited(startLocation) ? "Remove favorite" : "Save favorite"} style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: 14 }}>{isFavorited(startLocation) ? '★' : '☆'}</button>
                     <button onClick={() => { setStartLocation(null); setDestinations([]); resetRoute() }} style={{ background: 'none', border: 'none', color: '#64748b', cursor: 'pointer', fontSize: 16, padding: '0 2px' }}>×</button>
                   </div>
                 ) : (
@@ -678,7 +764,7 @@ export default function App() {
                         </div>
                         {(dest.area || dest.city) && <div style={{ fontSize: 11, color: '#64748b' }}>{[dest.area, dest.city].filter(Boolean).join(', ')}</div>}
                       </div>
-                      <button onClick={() => saveFavorite(dest)} title="Save" style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: 14 }}>⭐</button>
+                      <button onClick={() => toggleFavorite(dest)} title={isFavorited(dest) ? "Remove favorite" : "Save favorite"} style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: 14 }}>{isFavorited(dest) ? '★' : '☆'}</button>
                       <button onClick={() => { setDestinations(p => p.filter((_, j) => j !== i)); resetRoute() }} style={{ background: 'none', border: 'none', color: '#64748b', cursor: 'pointer', fontSize: 16, padding: '0 2px' }}>×</button>
                     </div>
                   ))}
@@ -721,16 +807,6 @@ export default function App() {
                   {isTracking ? 'Stop Tracking' : '📍 Live Track'}
                 </button>
 
-                {/* Voice toggle */}
-                {/* <button onClick={() => setVoiceEnabled(v => !v)} style={{
-                  background: voiceEnabled ? 'rgba(168,85,247,0.15)' : 'rgba(255,255,255,0.05)',
-                  border: `1px solid ${voiceEnabled ? 'rgba(168,85,247,0.35)' : 'rgba(255,255,255,0.1)'}`,
-                  borderRadius: 10, color: voiceEnabled ? '#a855f7' : '#64748b',
-                  fontSize: 12, fontWeight: 600, padding: '8px 0', cursor: 'pointer', width: '100%',
-                }}>
-                  🧭 Voice {voiceEnabled ? 'On' : 'Off'}
-                </button>
- */}
                 {result ? (
                   <>
                     <div style={{ display: 'flex', gap: 8 }}>
@@ -756,14 +832,11 @@ export default function App() {
 
                     {needsRecalc && (
                       <button
-                        onClick={handleSubmit}
-                        disabled={loading}
+                        onClick={handleSubmit} disabled={loading}
                         style={{
                           background: loading ? 'rgba(59,130,246,0.4)' : 'linear-gradient(135deg, #2563eb, #3b82f6)',
-                          border: 'none', borderRadius: 10, color: 'white',
-                          fontSize: 12, fontWeight: 700, padding: '8px 0',
-                          cursor: loading ? 'not-allowed' : 'pointer',
-                          width: '100%', letterSpacing: '0.02em',
+                          border: 'none', borderRadius: 10, color: 'white', fontSize: 12, fontWeight: 700, padding: '8px 0',
+                          cursor: loading ? 'not-allowed' : 'pointer', width: '100%', letterSpacing: '0.02em',
                         }}
                       >
                         {loading ? 'Routing...' : 'Recalculate Route'}
@@ -773,8 +846,7 @@ export default function App() {
                     {shareUrl && !needsRecalc && (
                       <button onClick={() => { navigator.clipboard.writeText(shareUrl); alert('Link copied!') }} style={{
                         background: 'rgba(251,191,36,0.1)', border: '1px solid rgba(251,191,36,0.25)',
-                        borderRadius: 10, color: '#fbbf24', fontSize: 12, fontWeight: 600,
-                        padding: '7px 0', cursor: 'pointer', width: '100%',
+                        borderRadius: 10, color: '#fbbf24', fontSize: 12, fontWeight: 600, padding: '7px 0', cursor: 'pointer', width: '100%',
                       }}>
                         📍 Copy Share Link
                       </button>
@@ -783,8 +855,7 @@ export default function App() {
                     {!needsRecalc && (
                       <button onClick={() => { setStartLocation(null); setDestinations([]); resetRoute() }} style={{
                         background: 'rgba(239,68,68,0.12)', border: '1px solid rgba(239,68,68,0.3)',
-                        borderRadius: 10, color: '#ef4444', fontSize: 12, fontWeight: 600,
-                        padding: '8px 0', cursor: 'pointer', width: '100%',
+                        borderRadius: 10, color: '#ef4444', fontSize: 12, fontWeight: 600, padding: '8px 0', cursor: 'pointer', width: '100%',
                       }}>
                         Clear route
                       </button>
@@ -796,8 +867,7 @@ export default function App() {
                       background: loading ? 'rgba(59,130,246,0.4)' : 'linear-gradient(135deg,#2563eb,#3b82f6)',
                       border: 'none', borderRadius: 12, color: 'white', fontSize: 14, fontWeight: 700,
                       padding: '12px 0', cursor: (!startLocation || !destinations.length) ? 'not-allowed' : 'pointer',
-                      opacity: (!startLocation || !destinations.length) ? 0.4 : 1,
-                      width: '100%', boxShadow: loading ? 'none' : '0 4px 16px rgba(37,99,235,0.4)',
+                      opacity: (!startLocation || !destinations.length) ? 0.4 : 1, width: '100%', boxShadow: loading ? 'none' : '0 4px 16px rgba(37,99,235,0.4)',
                     }}>
                       {loading ? 'Routing...' : '→ Get Route'}
                     </button>
@@ -821,7 +891,7 @@ export default function App() {
                     {(fav.area || fav.city) && <div style={{ fontSize: 11, color: '#64748b' }}>{[fav.area, fav.city].filter(Boolean).join(', ')}</div>}
                   </div>
                   <button onClick={() => handleSelectLocation(fav)} style={{ background: 'rgba(59,130,246,0.15)', border: '1px solid rgba(59,130,246,0.25)', borderRadius: 8, color: '#3b82f6', fontSize: 11, fontWeight: 600, padding: '4px 8px', cursor: 'pointer' }}>Go</button>
-                  <button onClick={() => removeFavorite(fav.lat, fav.lon)} style={{ background: 'none', border: 'none', color: '#475569', cursor: 'pointer', fontSize: 16 }}>×</button>
+                  <button onClick={() => removeFavorite(fav)} style={{ background: 'none', border: 'none', color: '#475569', cursor: 'pointer', fontSize: 16 }}>×</button>
                 </div>
               ))}
             </div>
@@ -841,39 +911,27 @@ export default function App() {
 
                   return(
                     <div key={routeId} onClick={() => handleSelectRoute(route)} style={{
-                      padding:'10px 12px', borderRadius:12,
+                      padding:'10px 12px', borderRadius:12, cursor: 'pointer',
                       background: isActive ? 'rgba(59,130,246,0.15)' : 'rgba(255,255,255,0.04)',
                       border: isActive ? '1px solid rgba(59,130,246,0.25)' : '1px solid rgba(255,255,255,0.07)',
                       transition:'all 0.15s ease'
                     }}>
-                      {/* top row */}
                       <div style={{ display:'flex', justifyContent:'space-between', marginBottom:6, alignItems:'center' }}>
                         <span style={{fontSize:13, fontWeight:600, color: isActive? '#93c5fd' : '#f1f5f9'}}> Route #{routeId}</span>
                         <span style={{ fontSize:11, color:'#475569' }}>{dateStr} {timeStr}</span>
                       </div>    
 
-                      {/* locations */}
                       <div style={{ fontSize:11, color:'#94a3b8', marginBottom:6, whiteSpace:'nowrap', overflow:'hidden', textOverflow:'ellipsis' }}>
                         {route.start_location?.name || 'Start'}
                         {' → '}
                         {route.destinations?.length || 0 } {destinations.length > 1 ? 'destination' : 'destinations'}
                       </div>
 
-                      <span style={{fontSize: 12,fontWeight: 600,
-                          color: isActive
-                            ? '#3b82f6'
-                            : '#cbd5e1',
-                        }}
-                      >
+                      <span style={{fontSize: 12,fontWeight: 600, color: isActive ? '#3b82f6' : '#cbd5e1' }}>
                         {route.stats?.total_distance_km ?? '—'} km
                       </span>
 
-                      <span
-                        style={{
-                          fontSize: 11,
-                          color: '#64748b',
-                        }}
-                      >
+                      <span style={{ fontSize: 11, color: '#64748b', marginLeft: 8 }}>
                         {route.destinations?.length ?? 0} stops
                       </span>
                     </div>
@@ -884,10 +942,79 @@ export default function App() {
             </div>
           )}
 
-
-
         </div>
       </div>
+
+      {/* ── AUTHENTICATION MODAL POPUP ── */}
+      {showLogoutModal && (
+        <div style={{ position: 'absolute', inset: 0, zIndex: 9998, display: 'grid', placeItems: 'center', background: 'rgba(15,23,42,0.85)', backdropFilter: 'blur(8px)' }}>
+          <div style={{ position: 'relative', width: 'min(420px, calc(100vw - 32px))', padding: 24, borderRadius: 24, background: 'rgba(15,23,42,0.95)', border: '1px solid rgba(255,255,255,0.08)', boxShadow: '0 20px 60px rgba(0,0,0,0.45)', color: '#e2e8f0' }}>
+            <h2 style={{ margin: '0 0 8px', fontSize: 24, lineHeight: 1.1 }}>Log out?</h2>
+            <p style={{ margin: '0 0 18px', color: '#94a3b8', fontSize: 14 }}>Are you sure you want to log out from your account?</p>
+
+            <div style={{ display: 'flex', gap: 10 }}>
+              <button
+                onClick={() => setShowLogoutModal(false)}
+                style={{ flex: 1, padding: '11px 14px', borderRadius: 12, border: '1px solid rgba(255,255,255,0.12)', background: 'rgba(255,255,255,0.04)', color: '#cbd5e1', fontWeight: 700, cursor: 'pointer' }}
+              >
+                Cancel
+              </button>
+              <button
+                onClick={confirmLogout}
+                style={{ flex: 1, padding: '11px 14px', borderRadius: 12, border: 'none', background: 'rgba(239,68,68,0.92)', color: 'white', fontWeight: 800, cursor: 'pointer' }}
+              >
+                Log out
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ──AUTHENTICATION MODAL POPUP ── */}
+      {showAuthModal && (
+        <div style={{ position: 'absolute', inset: 0, zIndex: 9999, display: 'grid', placeItems: 'center', background: 'rgba(15,23,42,0.85)', backdropFilter: 'blur(8px)' }}>
+          <div style={{ position: 'relative', width: 'min(460px, calc(100vw - 32px))', padding: 24, borderRadius: 24, background: 'rgba(15,23,42,0.95)', border: '1px solid rgba(255,255,255,0.08)', boxShadow: '0 20px 60px rgba(0,0,0,0.45)', color: '#e2e8f0' }}>
+            
+            {/* Close Button */}
+            <button onClick={() => setShowAuthModal(false)} style={{ position: 'absolute', top: 16, right: 16, background: 'transparent', border: 'none', color: '#94a3b8', cursor: 'pointer', fontSize: 24 }}>
+              ×
+            </button>
+
+            <div style={{ marginBottom: 18 }}>
+              <div style={{ fontSize: 12, textTransform: 'uppercase', letterSpacing: '0.12em', color: '#38bdf8', fontWeight: 700 }}>Delivery Route</div>
+              <h1 style={{ margin: '8px 0 6px', fontSize: 24, lineHeight: 1.1 }}>Sign in required</h1>
+              <p style={{ margin: 0, color: '#94a3b8', fontSize: 14 }}>Please log in to use saved locations and history.</p>
+            </div>
+
+            <div style={{ display: 'flex', gap: 8, marginBottom: 16 }}>
+              <button onClick={() => setAuthMode('login')} style={{ flex: 1, padding: '10px 12px', borderRadius: 12, border: '1px solid rgba(255,255,255,0.08)', background: authMode === 'login' ? 'rgba(59,130,246,0.2)' : 'rgba(255,255,255,0.04)', color: authMode === 'login' ? '#93c5fd' : '#cbd5e1', cursor: 'pointer', fontWeight: 700 }}>Login</button>
+              <button onClick={() => setAuthMode('signup')} style={{ flex: 1, padding: '10px 12px', borderRadius: 12, border: '1px solid rgba(255,255,255,0.08)', background: authMode === 'signup' ? 'rgba(34,197,94,0.2)' : 'rgba(255,255,255,0.04)', color: authMode === 'signup' ? '#86efac' : '#cbd5e1', cursor: 'pointer', fontWeight: 700 }}>Sign up</button>
+            </div>
+
+            <div style={{ display: 'grid', gap: 12 }}>
+              <input value={authUsername} onChange={e => setAuthUsername(e.target.value)} placeholder="Username" style={{ width: 'auto', padding: '12px 14px', borderRadius: 12, border: '1px solid rgba(255,255,255,0.1)', background: 'rgba(255,255,255,0.04)', color: '#f8fafc', outline: 'none' }} />
+              {authMode === 'signup' && (
+                <input value={authEmail} onChange={e => setAuthEmail(e.target.value)} placeholder="Email" type="email" style={{ width: 'auto', padding: '12px 14px', borderRadius: 12, border: '1px solid rgba(255,255,255,0.1)', background: 'rgba(255,255,255,0.04)', color: '#f8fafc', outline: 'none' }} />
+              )}
+              <input value={authPassword} onChange={e => setAuthPassword(e.target.value)} placeholder="Password" type="password" style={{ width: 'auto', padding: '12px 14px', borderRadius: 12, border: '1px solid rgba(255,255,255,0.1)', background: 'rgba(255,255,255,0.04)', color: '#f8fafc', outline: 'none' }} />
+              {authMode === 'signup' && (
+                <input value={authConfirmPassword} onChange={e => setAuthConfirmPassword(e.target.value)} placeholder="Confirm password" type="password" style={{ width: 'auto', padding: '12px 14px', borderRadius: 12, border: '1px solid rgba(255,255,255,0.1)', background: 'rgba(255,255,255,0.04)', color: '#f8fafc', outline: 'none' }} />
+              )}
+
+              <button
+                onClick={authMode === 'login' ? handleLogin : handleSignup}
+                disabled={authBusy || !authUsername || !authPassword || (authMode === 'signup' && (!authEmail || !authConfirmPassword))}
+                style={{ padding: '12px 14px', borderRadius: 12, border: 'none', background: authBusy ? 'rgba(59,130,246,0.45)' : 'linear-gradient(135deg, #2563eb, #38bdf8)', color: 'white', fontWeight: 800, cursor: authBusy ? 'not-allowed' : 'pointer' }}
+              >
+                {authBusy ? 'Please wait...' : authMode === 'login' ? 'Log in' : 'Create account'}
+              </button>
+
+              {authMessage && <div style={{ fontSize: 13, color: '#fca5a5', minHeight: 18 }}>{authMessage}</div>}
+            </div>
+          </div>
+        </div>
+      )}
+
     </div>
   )
 }
